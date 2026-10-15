@@ -28,6 +28,25 @@ grep -n "warning:" /tmp/build.log
 [ $ec -ne 0 ] && tail -100 /tmp/build.log
 ```
 
+### Concurrent builds (multiple agents or worktrees)
+
+The `LUXIR_COMPILE_JOBS` auto-cap sizes for the whole machine, so N builds
+running at once can exhaust RAM and freeze it. When building alongside other
+builds, cap compile and link parallelism per build (do not commit these):
+
+```bash
+export MOLD_JOBS=1 VCPKG_MAX_CONCURRENCY=4
+nice -n 10 cmake --preset gcc-debug -DLUXIR_COMPILE_JOBS=4
+nice -n 10 cmake --build --preset gcc-debug -j 4
+```
+
+Do not override `CMAKE_EXE_LINKER_FLAGS` to cap linker threads: on the ASan
+presets that drops `-fsanitize=address`. `MOLD_JOBS=1` serializes mold links
+across builds instead.
+
+Scale the `4`s down so (concurrent builds x jobs) stays within cores and
+roughly RAM / 2GB (more for ASan).
+
 ### Iterate (default): non-ASan, fastest edit-build-test
 
 ```bash

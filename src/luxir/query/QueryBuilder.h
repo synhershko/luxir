@@ -828,7 +828,7 @@ public:
         if (terms.empty()) {
           return matchNoDocs();
         }
-        FieldCodepointFolder folder(chain);
+        FieldCodepointFolder folder(&tc);
         auto termQuery = [&](std::string_view term) -> Query* {
           if (!caseInsensitive) return pool.make<TermQuery>(field, term);
           if (automaton::caseStable(term, folder)) {
