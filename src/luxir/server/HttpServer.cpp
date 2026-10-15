@@ -37,6 +37,7 @@
 #include <boost/none.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/bind_allocator.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/steady_timer.hpp>
 
@@ -61,6 +62,8 @@
 #include "luxir/util/Signal.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/ApiError.h"
+#include "luxir/util/ErrorLog.h"
+#include "luxir/util/ReservedHandler.h"
 
 namespace luxir {
 
@@ -69,10 +72,18 @@ namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
+static void runHttpContext(net::io_context& context, std::string_view operation) noexcept {
+  for (;;) {
+    try { context.run(); return; }
+    catch (...) { logCurrentException({operation, {}, {}, {}}); }
+  }
+}
+
 class HttpSession;
 
 class HttpIoShard {
 public:
+  ReservedHandlerAllocator<> exitAllocator;
   net::io_context ioc{1};
   net::steady_timer idleTimer{ioc};
   // Shard 0 is the warm floor after its first assignment. The accept thread
@@ -336,6 +347,8 @@ struct HttpStreamUpdateState {
 // request's teardown here on the task-arena thread.
 class HttpSearchRequest : public SearchRequest {
 public:
+  ReservedHandlerAllocator<> failureAllocator;
+  std::atomic<bool> failurePosted{false};
   std::unique_ptr<HttpSearchRequestState> requestState;
   std::shared_ptr<HttpSession> session;
   std::shared_ptr<ShardPin> shardPin;
@@ -369,6 +382,7 @@ public:
   // a final line that never comes.  Before any output, answer with an internal
   // error; after it, abort the stream so the truncation is visible.
   void failDelivery(const SearchResponse& response) noexcept;
+  void failDelivery() noexcept override;
   void resumeWhenDrained(std::function<void()> resume) override;
   // done() is inherited: releaseArena(&arena) frees this request (and its
   // ShardPin). reply() calls it eagerly once the final line is enqueued - the line
@@ -380,6 +394,62 @@ public:
 // executor-facing helpers below.
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
+  // Every handler tied to a connection has its own recovery boundary. The
+  // io_context boundary below is a last resort for server maintenance work.
+  template<class F>
+  auto guarded(F fn) {
+    return [self = shared_from_this(), fn = std::move(fn)](auto&&... args) mutable noexcept {
+      try { fn(std::forward<decltype(args)>(args)...); }
+      catch (...) { self->failRequest(); }
+    };
+  }
+
+  template<class F>
+  auto handler(F fn) {
+    return guarded([self = shared_from_this(), fn](auto&&... args) {
+      (self.get()->*fn)(std::forward<decltype(args)>(args)...);
+    });
+  }
+
+  template<class F>
+  void postCompletion(const ReservedHandlerAllocator<>& allocator, F fn) {
+    net::post(stream_.get_executor(), net::bind_allocator(allocator, guarded(std::move(fn))));
+  }
+
+  template<class F>
+  void post(F fn) {
+    net::post(stream_.get_executor(), guarded(std::move(fn)));
+  }
+
+  // The task arena has no caller to receive an exception. Preserve a failure
+  // delivery reservation and shard pin before work leaves the receiving thread.
+  template<class F>
+  void enqueue(F fn) {
+    ReservedHandlerAllocator<> allocator;
+    auto pin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), allocator, pin, fn = std::move(fn)]() noexcept {
+      try { fn(); }
+      catch (...) {
+        auto failure = std::current_exception();
+        self->postCompletion(allocator, [self, pin, failure] { std::rethrow_exception(failure); });
+      }
+    });
+  }
+
+  // Only on the shard. Once output started, closing is the only honest error
+  // signal; otherwise send a classified failure and refuse connection reuse.
+  void failRequest() noexcept {
+    try {
+      auto info = currentExceptionInfo(ErrorKind::INTERNAL);
+      if (!errorLogged_) { logError(info, errorContext()); errorLogged_ = true; }
+      bool started = outputStarted_ || headerSent_ || writeOutstanding_;
+      abandonOutput();
+      keepAlive_ = false;
+      terminalStreamingFailure_ = true;
+      if (!started) { respondError(info); return; }
+    } catch (...) { logCurrentException({"http.failure", {}, {}, {}}); }
+    try { doTerminalStreamingClose(); } catch (...) {}
+  }
   std::stop_source waitCancellation;
   net::cancellation_signal waitDisconnect_;
   uint64_t waitDisconnectEpoch_ = 0;
@@ -507,7 +577,12 @@ public:
   void whenDrained(std::function<void()> resume) {
     net::dispatch(stream_.get_executor(),
         [self = shared_from_this(), resume = std::move(resume)]() mutable {
-          self->drainWaiters_.push_back(std::move(resume));
+          try { self->drainWaiters_.push_back(std::move(resume)); }
+          catch (...) {
+            self->failRequest();
+            if (resume) resume();
+            return;
+          }
           self->maybeFireDrainWaiters();
         });
   }
@@ -522,7 +597,7 @@ public:
   // instead of a complete-looking result.  This is the docs format's
   // mid-stream error signal - it has no envelope to carry an error in-band.
   void abortStream() {
-    net::post(stream_.get_executor(), [self = shared_from_this()] {
+    post([self = shared_from_this()] {
       if (!self->errored_) {
         self->failWrites(net::error::make_error_code(net::error::operation_aborted));
       }
@@ -534,7 +609,7 @@ public:
   // Dropped if the connection has failed or a streaming response already
   // started (the abortStream contract covers that case).
   void respondErrorFromEngine(http::status status, std::string body) {
-    net::post(stream_.get_executor(),
+    post(
         [self = shared_from_this(), status, body = std::move(body)]() mutable {
           if (self->errored_) return;
           if (self->ticketLost_.load(std::memory_order_relaxed)) {
@@ -680,6 +755,13 @@ private:
 
   UpdateUrlParams updateUrl_;
   bool pretty_ = false;  // fixed before submitting work for this request
+  bool errorLogged_ = false;
+  bool outputStarted_ = false;
+  std::string operation_ = "http";
+
+  ErrorContext errorContext() const {
+    return {operation_, tenant_, route_.coll, requestId_};
+  }
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
   // producers but not yet written to the socket (earlyLines_ + pendingQ_ +
@@ -729,6 +811,7 @@ private:
     std::weak_ptr<HttpStreamBatchState> batch_;
     std::uint64_t ordinal_;
     HttpStreamBatchResult result_;
+    ReservedHandlerAllocator<> completionAllocator;
 
   public:
     StreamingUpdateMessage(const HttpUpdateReqProto* req,
@@ -748,10 +831,23 @@ private:
 
     void done(IndexWriter& iw) noexcept override {
       unused(iw);
+      std::shared_ptr<Completion> completed;
+      std::exception_ptr failure;
       try {
-        auto completed = takeCompletion(session_->node_);
-        net::post(session_->stream_.get_executor(),
-            [session = session_, state = state_, ordinal = ordinal_, result = std::move(result_), completed]() mutable {
+        Signal::emit("httpUpdateCompletion");
+        completed = takeCompletion(session_->node_);
+      } catch (...) { failure = std::current_exception(); }
+      // The reservation was allocated before admission; this post does not
+      // allocate its handler while the engine may be out of memory.
+      session_->postCompletion(completionAllocator,
+          [self = shared_from_this(), completed, failure]() mutable {
+            auto session = self->session_;
+            auto state = self->state_;
+            auto ordinal = self->ordinal_;
+            auto allocator = self->completionAllocator;
+            auto result = std::move(self->result_);
+            try {
+              if (failure) std::rethrow_exception(failure);
               auto entry = state->inFlightBatches.find(ordinal);
               assert(entry != state->inFlightBatches.end());
               // Preserve the admission slot until visibility completion, but free
@@ -760,29 +856,33 @@ private:
                 state->group.request.reset();
               entry->second.reset();
               if (completed->wait) session->watchWaitDisconnect();
-              completed->await(session->node_, [session, state, ordinal, waiting = completed->wait.has_value(), result = std::move(result)](auto response) mutable {
-                const auto& resp = response->response;
-                try {
-                  result.status = resp.status;
-                  result.updateVersion = resp.update_version;
-                  result.replicas = resp.replicas;
-                  result.commit = response->commit;
-                  if (resp.error) result.error = api::build::errorInfo(*resp.error);
-                  for (auto id : resp.ids) result.ids.emplace_back(id);
-                  for (const auto& e : resp.errors) result.errors.push_back({std::string(e.id),
-                      e.error ? api::build::errorInfo(*e.error) : ErrorInfo::of(ErrorKind::INTERNAL, "document error without detail"), e.index});
-                } catch (...) { result.failed = true; result.error = currentExceptionInfo(ErrorKind::INTERNAL); }
-                net::post(session->stream_.get_executor(), [session, state, ordinal, waiting, result = std::move(result)]() mutable {
-                  if (waiting) session->stopWaitDisconnect();
-                  session->onStreamBatchDone(state, ordinal, std::move(result));
+              completed->await(session->node_, [session, state, ordinal, allocator, waiting = completed->wait.has_value(), result = std::move(result)](auto response) mutable {
+                session->postCompletion(allocator, [session, state, ordinal, waiting, response, result = std::move(result)]() mutable {
+                  try {
+                    const auto& resp = response->response;
+                    result.status = resp.status;
+                    result.updateVersion = resp.update_version;
+                    result.replicas = resp.replicas;
+                    result.commit = response->commit;
+                    if (resp.error) result.error = api::build::errorInfo(*resp.error);
+                    for (auto id : resp.ids) result.ids.emplace_back(id);
+                    for (const auto& e : resp.errors) result.errors.push_back({std::string(e.id),
+                        e.error ? api::build::errorInfo(*e.error) : ErrorInfo::of(ErrorKind::INTERNAL, "document error without detail"), e.index});
+                    if (waiting) session->stopWaitDisconnect();
+                    session->onStreamBatchDone(state, ordinal, std::move(result));
+                  } catch (...) { session->failStreamBatch(state, ordinal); }
                 });
               }, session->waitCancellation.get_token());
-            });
-      } catch (...) { LOG_ERROR("Streaming update completion handoff failed"); }
+            } catch (...) {
+              session->failStreamBatch(state, ordinal);
+            }
+          });
     }
   };
 
   void doRead() {
+    errorLogged_ = false;
+    outputStarted_ = false;
     requestId_.clear();
     pretty_ = false;
     updateUrl_ = {};
@@ -796,7 +896,7 @@ private:
     streamUpdate_.reset();
     terminalStreamingFailure_ = false;
     http::async_read_header(stream_, buffer_, *parser_,
-        beast::bind_front_handler(&HttpSession::onRead, shared_from_this()));
+        handler(&HttpSession::onRead));
   }
 
   void onRead(beast::error_code ec, std::size_t) {
@@ -822,6 +922,7 @@ private:
 
     route_ = matchRoute(target);
     startRequestMetric();
+    operation_ = target;
     // The request's scope is settled with its route, before the buffered and
     // streaming paths split; nothing carries over from an earlier request.
     tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
@@ -853,7 +954,7 @@ private:
         return;
       }
       parser_->body_limit(boost::none);
-      startStreamingUpdate(std::move(route_.coll), std::move(updateUrl_));
+      startStreamingUpdate(route_.coll, std::move(updateUrl_));
       return;
     }
 
@@ -890,7 +991,7 @@ private:
     parser_->get().body().data = bodyBuf_.data();
     parser_->get().body().size = bodyBuf_.size();
     http::async_read(stream_, buffer_, *parser_,
-        beast::bind_front_handler(&HttpSession::onBufferedBodyRead, shared_from_this()));
+        handler(&HttpSession::onBufferedBodyRead));
   }
 
   void onBufferedBodyRead(beast::error_code ec, std::size_t) {
@@ -911,6 +1012,7 @@ private:
   }
 
   void dispatchBufferedRequest() {
+    Signal::emit("httpRequestDispatch");
     http::request<http::string_body> req;
     req.base() = parser_->get().base();
     req.body() = std::move(bufferedBody_);
@@ -1648,12 +1750,12 @@ private:
 
   void handleSearch(const std::string& body, const std::string& coll, HttpSearchFormat format,
                     const SearchUrlOverlay& overlay) {
-    auto* arena = createArena();
+    std::unique_ptr<google::protobuf::Arena, decltype(&releaseArena)> ownedArena(createArena(), releaseArena);
+    auto* arena = ownedArena.get();
     auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
       parseEffectiveRequest(body, coll, overlay, *requestState);
     } catch (const std::exception& e) {
-      releaseArena(arena);
       respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
@@ -1667,7 +1769,6 @@ private:
     bool docsMultiOp = false;
     if (format == HttpSearchFormat::DOCS) {
       if (const char* err = validateDocsFormat(requestState->proto)) {
-        releaseArena(arena);
         respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
         return;
       }
@@ -1699,6 +1800,7 @@ private:
     // synchronous engine.submit() onto the task arena so this io thread is
     // not occupied for the query's duration; reply() then posts results back
     // here.
+    ownedArena.release();
     engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
 
@@ -1738,32 +1840,40 @@ private:
       std::shared_ptr<HttpSession> session;
       std::shared_ptr<HttpUpdateState> state;
       std::shared_ptr<ShardPin> pin;
+      ReservedHandlerAllocator<> completionAllocator;
     public:
       Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
           : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
-      void done(IndexWriter&) override {
-        auto completed = takeCompletion(session->node_);
+      void done(IndexWriter&) noexcept override {
         auto target = session;
         auto guard = pin;
+        auto allocator = completionAllocator;
+        std::shared_ptr<Completion> completed;
+        std::exception_ptr failure;
+        try {
+          Signal::emit("httpUpdateCompletion");
+          completed = takeCompletion(session->node_);
+        } catch (...) { failure = std::current_exception(); }
         delete this;
-        completed->await(target->node_, [target, guard](auto result) {
-          net::post(target->stream_.get_executor(), [target, guard, result] {
-            try {
+        target->postCompletion(allocator, [target, guard, allocator, completed, failure] {
+          if (failure) std::rethrow_exception(failure);
+          completed->await(target->node_, [target, guard, allocator](auto result) {
+            target->postCompletion(allocator, [target, guard, result] {
               std::string out;
               if (result->response.status != api::UpdateResponse_::Status::OK)
                 target->metricError(result->response.error ? (ErrorKind)result->response.error->kind : ErrorKind::INVALID_REQUEST);
               if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
               target->respondJson(http::status::ok, std::move(out));
-            } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
-          });
-        }, target->waitCancellation.get_token());
+            });
+          }, target->waitCancellation.get_token());
+        });
       }
     };
     try {
       if (state->proto.commit && state->proto.commit->wait_for_replicas) watchWaitDisconnect();
       auto admission = std::make_unique<Update>(shared_from_this(), std::move(state), shardPin);
       auto* msg = admission.get();
-      node_.getTaskArena().enqueue([self = shared_from_this(), msg, tenant = tenant_, shardPin] {
+      enqueue([self = shared_from_this(), msg, tenant = tenant_, shardPin] {
         try {
           auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, msg->req->collection));
           msg->target = collection->getId();
@@ -1772,7 +1882,7 @@ private:
         } catch (...) {
           delete msg;
           auto failure = currentExceptionInfo(ErrorKind::INTERNAL);
-          net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
+          self->post([self, shardPin, failure] { self->respondError(failure); });
         }
       });
       admission.release();
@@ -1850,7 +1960,7 @@ private:
     } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin, wait] {
+    enqueue([self = shared_from_this(), state, id, shardPin, wait] {
       try {
         auto created = self->node_.createCollection(id,
             state->request.schema ? &*state->request.schema : nullptr);
@@ -1890,24 +2000,24 @@ private:
   void respondPublished(std::shared_ptr<ShardPin> pin, CollectionId id, const CommitId& commit,
                         const std::optional<PublicationWait>& wait, ReplicationSource::Members members,
                         std::function<std::string(const std::optional<api::ReplicaResult>&)> render) {
-    auto respond = [self = shared_from_this(), pin, render = std::move(render), waiting = wait.has_value()]
+    ReservedHandlerAllocator<> allocator;
+    auto renderer = std::make_shared<decltype(render)>(std::move(render));
+    auto respond = [self = shared_from_this(), pin, renderer, allocator, waiting = wait.has_value()]
                    (std::optional<api::ReplicaResult> replicas) {
-      std::variant<std::string, ErrorInfo> result;
-      try { result = render(replicas); }
-      catch (const std::exception& e) { result = classifyException(e, ErrorKind::INTERNAL); }
-      self->finishPublication(pin, waiting, std::move(result));
+      self->postCompletion(allocator, [self, pin, renderer, waiting, replicas] {
+        if (waiting) self->stopWaitDisconnect();
+        self->respondJson(http::status::ok, (*renderer)(replicas));
+      });
     };
     if (!wait) { respond(std::nullopt); return; }
     auto& waits = node_.getCommitWaits();
     waits.awaitReplicas(waits.prepareReplicas(std::move(id), commit, wait->requirement,
                                               waits.deadlineAfter(wait->timeoutMs), members),
-        wait->stop, [self = shared_from_this(), respond = std::move(respond)](api::ReplicaResult replicas) {
-          self->node_.getTaskArena().enqueue([respond, replicas] { respond(replicas); });
-        });
+        wait->stop, std::move(respond));
   }
 
   void finishPublication(std::shared_ptr<ShardPin> pin, bool waiting, std::variant<std::string, ErrorInfo> result) {
-    net::post(stream_.get_executor(), [self = shared_from_this(), pin, waiting, result = std::move(result)]() mutable {
+    post([self = shared_from_this(), pin, waiting, result = std::move(result)]() mutable {
       if (waiting) self->stopWaitDisconnect();
       if (auto* body = std::get_if<std::string>(&result)) self->respondJson(http::status::ok, std::move(*body));
       else self->respondError(std::get<ErrorInfo>(result));
@@ -1934,7 +2044,7 @@ private:
     catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin] {
+    enqueue([self = shared_from_this(), state, id, shardPin] {
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
@@ -1948,7 +2058,7 @@ private:
         failure = classifyException(e, ErrorKind::INTERNAL);
       }
 
-      net::post(self->stream_.get_executor(),
+      self->post(
           [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
             if (failure) self->respondError(*failure);
             else self->respondJson(http::status::ok, std::move(body));
@@ -1976,7 +2086,7 @@ private:
   void handleSchemaGet(const std::string& coll, bool resolved) {
     if (resolved) {
       auto shardPin = makeShardPin();
-      node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, shardPin] {
+      enqueue([self = shared_from_this(), coll, tenant = tenant_, shardPin] {
         std::string out;
         std::optional<ErrorInfo> failure;
         try {
@@ -1985,7 +2095,7 @@ private:
         } catch (const std::exception& e) {
           failure = classifyException(e, ErrorKind::INTERNAL);
         }
-        net::post(self->stream_.get_executor(),
+        self->post(
                   [self, shardPin, failure = std::move(failure), out = std::move(out)]() mutable {
                     if (failure) self->respondError(*failure);
                     else self->respondJson(http::status::ok, std::move(out));
@@ -2077,9 +2187,9 @@ private:
               if (auto session = weak.lock()) session->finishReplicationWatch(epoch);
             });
           }, replicationTenants_);
-      replicationTimer_->async_wait([self = shared_from_this(), epoch](beast::error_code ec) {
+      replicationTimer_->async_wait(guarded([self = shared_from_this(), epoch](beast::error_code ec) {
         if (!ec) self->finishReplicationWatch(epoch);
-      });
+      }));
       if (replicationWatch_) Signal::emit("replicationWatchParked", this);
     } catch (const std::exception& e) {
       cancelReplicationWatch();
@@ -2163,7 +2273,7 @@ private:
     if (transfer->file) transfer->file->prefetch(transfer->offset, 4 * length);
     startReplicationWrite(*transfer);
     stream_.async_write_some(net::buffer(transfer->data.data() + transfer->offset, length),
-        [self = shared_from_this(), transfer](beast::error_code ec, size_t bytes) {
+        guarded([self = shared_from_this(), transfer](beast::error_code ec, size_t bytes) {
           self->finishReplicationWrite(*transfer, ec);
           if (ec) { self->abortReplicationTransfer(self->replicationTransferEpoch_); self->doClose(); return; }
           transfer->offset += bytes;
@@ -2177,7 +2287,7 @@ private:
             transfer->nextTouch = time + std::chrono::milliseconds(interval);
           }
           self->writeReplicationBody(transfer);
-        });
+        }));
   }
 
   // Malformed/unsupported ranges are ignored. Syntactically valid ranges that
@@ -2232,7 +2342,7 @@ private:
       }
     } catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST), requestId_, head); return; }
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, identity, range, head, json, shardPin] {
+    enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, identity, range, head, json, shardPin] {
       auto transfer = std::make_shared<ReplicationTransfer>();
       transfer->head = head;
       transfer->json = json;
@@ -2265,7 +2375,7 @@ private:
         transfer->end = transfer->data.size();
         if (!head && !range.empty() && !name.empty()) status = replicationRange(range, *transfer);
       } catch (...) { failure = currentExceptionInfo(ErrorKind::INTERNAL); }
-      net::post(self->stream_.get_executor(), [self, transfer, failure, status, shardPin] {
+      self->post([self, transfer, failure, status, shardPin] {
         if (self->replicationStopped_) return;
         if (failure) { self->respondError(*failure, self->requestId_, transfer->head); return; }
         if (transfer->cancellation.stop_requested()) { self->respondError(classifyException(SnapshotExpiredError(), ErrorKind::NOT_FOUND), self->requestId_, transfer->head); return; }
@@ -2297,12 +2407,13 @@ private:
         response.content_length(transfer->end - transfer->offset);
         transfer->serializer.emplace(response);
         self->startReplicationWrite(*transfer);
+        self->outputStarted_ = true;
         http::async_write_header(self->stream_, *transfer->serializer,
-            [self, transfer](beast::error_code ec, size_t) {
+            self->guarded([self, transfer](beast::error_code ec, size_t) {
               self->finishReplicationWrite(*transfer, ec);
               if (ec) self->doClose();
               else self->writeReplicationBody(transfer);
-            });
+            }));
       });
     });
   }
@@ -2310,7 +2421,7 @@ private:
   void handleStats(std::optional<std::string> coll, std::string tenant, bool includeSegments,
                    bool includeMemory) {
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue(
+    enqueue(
         [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), includeSegments,
          includeMemory, shardPin] {
           std::string out;
@@ -2333,7 +2444,7 @@ private:
             failure = classifyException(e, ErrorKind::INTERNAL);
           }
 
-          net::post(self->stream_.get_executor(),
+          self->post(
                     [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
                       if (failure) self->respondError(*failure);
                       else self->respondJson(http::status::ok, std::move(body));
@@ -2367,7 +2478,7 @@ private:
     // updateSchema persists (fsync) under the publication mutex, so run
     // it off the io thread like handleUpdate.
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, wait, target = LuxirNode::target(tenant_, coll)] {
+    enqueue([self = shared_from_this(), state, shardPin, mode, wait, target = LuxirNode::target(tenant_, coll)] {
       try {
         auto collection = self->node_.getOrCreateCollection(target);
         auto newSchema = collection->updateSchema(state->def, mode);
@@ -2404,13 +2515,14 @@ private:
     resp->body() = finishJson(renderErrorBody(info, requestId_));
     if (route_.route != Route::METRICS) metrics->sentBytes[0].fetch_add(resp->body().size(), std::memory_order_relaxed);
     resp->prepare_payload();
+    outputStarted_ = true;
     http::async_write(stream_, *resp,
-        [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
+        guarded([self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
           if (ec) { self->doClose(); return; }
           self->finishRequestMetric();
           if (resp->keep_alive()) self->doRead();
           else self->doClose();
-        });
+        }));
   }
 
   static std::int32_t cappedErrorIndex(std::size_t index) {
@@ -2673,7 +2785,7 @@ private:
     // this to async_read.
     state->readInFlight = true;
     http::async_read_some(stream_, buffer_, *parser_,
-        beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
+        handler(&HttpSession::onStreamBodyRead));
   }
 
   void onStreamBodyRead(beast::error_code ec, std::size_t) {
@@ -3183,7 +3295,7 @@ private:
     }
 
     state->barrierPending = false;
-    net::post(stream_.get_executor(), [self = shared_from_this(), state] {
+    post([self = shared_from_this(), state] {
       if (self->streamUpdate_ == state && !state->failed) self->drainStreamRecords();
     });
   }
@@ -3262,6 +3374,13 @@ private:
       return state->canAdmit();
     }
     return true;
+  }
+
+  void failStreamBatch(const std::shared_ptr<HttpStreamUpdateState>& state, uint64_t ordinal) noexcept {
+    // onStreamBatchDone may have removed it before a later render failed.
+    if (state->inFlightBatches.erase(ordinal)) --state->inFlight;
+    failRequest();
+    if (state->inFlight == 0) state->shardPin.reset();
   }
 
   void onStreamBatchDone(const std::shared_ptr<HttpStreamUpdateState>& state,
@@ -3441,7 +3560,7 @@ private:
 
   void submitUrlCommit(const std::shared_ptr<HttpStreamUpdateState>& state,
                        const std::shared_ptr<UrlWriters>& writers, size_t index) {
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, writers, index] {
+    enqueue([self = shared_from_this(), state, writers, index] {
       try {
         auto request = std::make_shared<HttpUpdateState>();
         request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
@@ -3454,23 +3573,34 @@ private:
           std::shared_ptr<HttpStreamUpdateState> state;
           std::shared_ptr<UrlWriters> writers;
           size_t index;
+          ReservedHandlerAllocator<> completionAllocator;
         public:
           Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
                  std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
               : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
                 state(std::move(state)), writers(std::move(writers)), index(index) {}
-          void done(IndexWriter&) override {
-            auto completed = takeCompletion(session->node_);
+          void done(IndexWriter&) noexcept override {
             auto target = session;
             auto streamState = state;
-            auto collectionName = (*writers)[index].first;
+            auto targets = writers;
+            auto position = index;
+            auto allocator = completionAllocator;
+            std::shared_ptr<Completion> completed;
+            std::exception_ptr failure;
+            try {
+              Signal::emit("httpUrlCommitCompletion");
+              completed = takeCompletion(session->node_);
+            } catch (...) { failure = std::current_exception(); }
             delete this;
-            completed->await(target->node_, [target, streamState, collectionName](auto result) {
-              auto error = result->response.error ? std::optional(api::build::errorInfo(*result->response.error)) : std::nullopt;
-              net::post(target->stream_.get_executor(), [target, streamState, collectionName, result, error]() mutable {
-                target->onUrlCommitDone(streamState, collectionName, result->commit, result->response.replicas, std::move(error));
-              });
-            }, target->waitCancellation.get_token());
+            target->postCompletion(allocator, [target, streamState, targets, position, allocator, completed, failure] {
+              if (failure) std::rethrow_exception(failure);
+              completed->await(target->node_, [target, streamState, targets, position, allocator](auto result) {
+                target->postCompletion(allocator, [target, streamState, targets, position, result] {
+                  auto error = result->response.error ? std::optional(api::build::errorInfo(*result->response.error)) : std::nullopt;
+                  target->onUrlCommitDone(streamState, (*targets)[position].first, result->commit, result->response.replicas, std::move(error));
+                });
+              }, target->waitCancellation.get_token());
+            });
           }
         };
         auto* msg = new Commit(std::move(request), self, state, writers, index);
@@ -3479,7 +3609,7 @@ private:
         catch (...) { delete msg; throw; }
       } catch (...) {
         auto error = currentExceptionInfo(ErrorKind::INTERNAL);
-        net::post(self->stream_.get_executor(), [self, state, writers, index, error] {
+        self->post([self, state, writers, index, error] {
           self->onUrlCommitDone(state, (*writers)[index].first, {}, {}, error);
         });
       }
@@ -3521,7 +3651,7 @@ private:
       startStreamingHeader();
       writeOutstanding_ = true;
       http::async_write_header(stream_, *sr_,
-          beast::bind_front_handler(&HttpSession::onHeaderWritten, shared_from_this()));
+          handler(&HttpSession::onHeaderWritten));
       return;
     }
     if (!pendingQ_.empty()) {
@@ -3538,19 +3668,19 @@ private:
         chunkLastSent_ = true;
         writeOutstanding_ = true;
         net::async_write(stream_, http::make_chunk_last(),
-            beast::bind_front_handler(&HttpSession::onChunkLastWritten, shared_from_this()));
+            handler(&HttpSession::onChunkLastWritten));
         return;
       }
       writeOutstanding_ = true;
       net::async_write(stream_, http::make_chunk(net::buffer(inflightLine_)),
-          beast::bind_front_handler(&HttpSession::onChunkWritten, shared_from_this()));
+          handler(&HttpSession::onChunkWritten));
       return;
     }
     if (lastSeen_ && !chunkLastSent_) {
       chunkLastSent_ = true;
       writeOutstanding_ = true;
       net::async_write(stream_, http::make_chunk_last(),
-          beast::bind_front_handler(&HttpSession::onChunkLastWritten, shared_from_this()));
+          handler(&HttpSession::onChunkLastWritten));
     }
   }
 
@@ -3675,7 +3805,8 @@ private:
     resp->keep_alive(keepAlive_);
     resp->body() = std::move(body);
     resp->prepare_payload();
-    auto done = [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
+    outputStarted_ = true;
+    auto done = guarded([self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
       if (ec) {
         if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
         else self->doClose();
@@ -3685,10 +3816,10 @@ private:
       if (resp->keep_alive()) self->doRead();
       else if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
       else self->doClose();
-    };
+    });
     if (head) {
       auto serializer = std::make_shared<http::response_serializer<http::string_body>>(*resp);
-      http::async_write_header(stream_, *serializer, [serializer, done](beast::error_code ec, size_t bytes) { done(ec, bytes); });
+      http::async_write_header(stream_, *serializer, [serializer, done](beast::error_code ec, size_t bytes) mutable { done(ec, bytes); });
     } else http::async_write(stream_, *resp, std::move(done));
   }
 
@@ -3698,6 +3829,12 @@ private:
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
   void respondError(const ErrorInfo& info, std::string_view requestId, bool head = false) {
     metricError(info.kind);
+    if ((info.kind == ErrorKind::INTERNAL || info.kind == ErrorKind::UNKNOWN) && !errorLogged_) {
+      auto context = errorContext();
+      context.requestId = requestId;
+      logError(info, context);
+      errorLogged_ = true;
+    }
     respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head);
   }
   // An unread body cannot be reused as the next request. Answer, then close.
@@ -3750,6 +3887,8 @@ public:
 };
 
 void HttpSession::run() {
+  beast::error_code nde;
+  stream_.socket().set_option(tcp::no_delay(true), nde);
   {
     std::lock_guard<std::mutex> lk(registry_->mtx);
     if (registry_->shuttingDown) {
@@ -3767,7 +3906,7 @@ void HttpSession::run() {
     };
   }
   net::post(stream_.get_executor(),
-      beast::bind_front_handler(&HttpSession::doRead, shared_from_this()));
+      handler(&HttpSession::doRead));
 }
 
 SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
@@ -3793,6 +3932,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
       if (queued > session->highWater()) { session->metricPause(); status = ReplyStatus::PAUSE; }
     }
   } catch (...) {
+    status = ReplyStatus::CANCEL;
     failDelivery(response);
   }
   if (last) {
@@ -3860,6 +4000,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       }
     }
   } catch (...) {
+    status = ReplyStatus::CANCEL;
     failDelivery(response);
   }
   if (last) {
@@ -3871,17 +4012,22 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
 }
 
 void HttpSearchRequest::failDelivery(const SearchResponse& response) noexcept {
-  try {
-    if (outputCommitted) {
-      session->abortStream();
-      return;
-    }
-    ErrorInfo info = ErrorInfo::of(ErrorKind::INTERNAL, "failed to render the response");
-    session->respondErrorFromEngine(httpStatusFor(info),
-                                    renderErrorBody(info, response.proto.request_id));
-  } catch (...) {
-    try { session->abortStream(); } catch (...) {}
+  unused(response);
+  if (failurePosted.exchange(true)) return;
+  auto failure = std::current_exception();
+  session->postCompletion(failureAllocator, [target = session, pin = shardPin, failure] {
+    std::rethrow_exception(failure);
+  });
+}
+
+void HttpSearchRequest::failDelivery() noexcept {
+  if (!failurePosted.exchange(true)) {
+    auto failure = std::current_exception();
+    session->postCompletion(failureAllocator, [target = session, pin = shardPin, failure] {
+      std::rethrow_exception(failure);
+    });
   }
+  done();
 }
 
 void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
@@ -3952,7 +4098,7 @@ void HttpServer::start() {
   // linger and can be spawned again by a later assignment.
   acceptThread = std::thread([this] {
     nameThisThread("luxir_accept");
-    acceptIoc.run();
+    runHttpContext(acceptIoc, "http.accept");
   });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
@@ -3966,16 +4112,18 @@ void HttpServer::armReplicationExpiry() {
     if (ec || shutdownRequested.load(std::memory_order_acquire)) return;
     // The guard joins this arena task before the accept context can exit.
     auto guard = net::make_work_guard(acceptIoc);
-    node.getTaskArena().enqueue([this, guard = std::move(guard)] {
+    auto expire = [this, guard = std::move(guard)] {
       try {
         for (const auto& entry : node.collectionEntries()) {
           if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();
         }
         node.getReplication().expire();
         Signal::emit("replicationExpiryTick");
-      } catch (const std::exception& e) { LOG_WARN("Replication expiry failed: {}", e.what()); }
-      net::post(acceptIoc, [this, guard] { armReplicationExpiry(); });
-    });
+      } catch (...) { logCurrentException({"replication.expire", {}, {}, {}}); }
+      net::post(acceptIoc, net::bind_allocator(expiryAllocator, [this, guard] { armReplicationExpiry(); }));
+    };
+    try { node.getTaskArena().enqueue(expire); }
+    catch (...) { expire(); }
   });
 }
 
@@ -4016,10 +4164,10 @@ void HttpServer::spawnShard(std::size_t idx) {
     char name[16];
     snprintf(name, sizeof(name), "luxir_http_%zu", idx);
     nameThisThread(name);
-    shard->ioc.run();
+    runHttpContext(shard->ioc, "http.worker");
     runningShardThreads.fetch_sub(1, std::memory_order_relaxed);
     node.metrics->httpThreads.fetch_sub(1, std::memory_order_relaxed);
-    net::post(acceptIoc, [this, idx] { shardExited(idx); });
+    net::post(acceptIoc, net::bind_allocator(shard->exitAllocator, [this, idx] { shardExited(idx); }));
   });
 }
 
@@ -4054,21 +4202,29 @@ void HttpServer::doAccept() {
   acceptor->async_accept(shard->ioc.get_executor(),
       [this, shard, idx](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
-        if (!ec) {
-          shard->activityEpoch.fetch_add(1, std::memory_order_release);
-          shard->liveConnections.fetch_add(1, std::memory_order_release);
-          // Only the accept thread spawns and reaps. joinable() therefore means
-          // spawned and not yet reaped; the runner may already have returned.
-          // shardExited() respawns if this assignment lands in that window.
-          if (!shard->thread.joinable()) spawnShard(idx);
-          // Small request/response exchanges on a keep-alive connection stall
-          // ~40ms per round trip under Nagle + delayed ACK; disable Nagle like
-          // every HTTP server does.  Best-effort: an ec here is not fatal.
-          beast::error_code nde;
-          sock.set_option(tcp::no_delay(true), nde);
-          std::make_shared<HttpSession>(shard, std::move(sock), node, registry,
-                                        streamBufferBytes_)->run();
-        }
+        try {
+          if (ec) {
+            LOG_WARN("HTTP accept failed: {}", ec.message());
+          } else {
+            shard->activityEpoch.fetch_add(1, std::memory_order_release);
+            shard->liveConnections.fetch_add(1, std::memory_order_release);
+            std::shared_ptr<HttpSession> session;
+            try {
+              session = std::make_shared<HttpSession>(shard, std::move(sock), node, registry, streamBufferBytes_);
+            } catch (...) {
+              shard->liveConnections.fetch_sub(1, std::memory_order_release);
+              throw;
+            }
+            // Only the accept thread spawns and reaps. joinable() therefore means
+            // spawned and not yet reaped; the runner may already have returned.
+            // shardExited() respawns if this assignment lands in that window.
+            if (!shard->thread.joinable()) spawnShard(idx);
+            // Small request/response exchanges on a keep-alive connection stall
+            // ~40ms per round trip under Nagle + delayed ACK; disable Nagle like
+            // every HTTP server does.  Best-effort: an ec here is not fatal.
+            session->run();
+          }
+        } catch (...) { logCurrentException({"http.accept", {}, {}, {}}); }
         if (acceptor && acceptor->is_open()) doAccept();
       });
 }
