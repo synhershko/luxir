@@ -6,6 +6,7 @@
 #include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
+#include "Prometheus.h"
 
 #include <cassert>
 #include <array>
@@ -381,16 +382,26 @@ public:
 
   HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
               std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
-    : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
-      highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {}
+    : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), metrics(node.metrics), registry_(std::move(registry)),
+      highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {
+      metrics->httpConnections.fetch_add(1, std::memory_order_relaxed);
+    }
 
   ~HttpSession() {
+    metrics->httpConnections.fetch_sub(1, std::memory_order_relaxed);
     if (deregister_) deregister_();
     // Publish activity before publishing the transition to zero. The idle
     // timer's acquire load of liveConnections then observes this epoch bump.
     shard_->activityEpoch.fetch_add(1, std::memory_order_release);
     shard_->liveConnections.fetch_sub(1, std::memory_order_release);
   }
+
+  void metricError(ErrorKind kind = ErrorKind::UNKNOWN) {
+    if (route_.route == Route::METRICS) return;
+    if (!metricFailed.exchange(true, std::memory_order_relaxed))
+      metrics->errors[0][(size_t)kind].fetch_add(1, std::memory_order_relaxed);
+  }
+  void metricPause() { metrics->streamPauses[0].fetch_add(1, std::memory_order_relaxed); }
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
 
@@ -434,6 +445,7 @@ public:
   // the dispatch, so the count never lags the producer.
   int64_t enqueueLine(std::string line, bool last) {
     int64_t bytes = (int64_t)line.size();
+    metrics->sentBytes[0].fetch_add(bytes, std::memory_order_relaxed);
     int64_t queued = queuedBytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     uint64_t ticket = lineTickets_.fetch_add(1, std::memory_order_relaxed);
     try {
@@ -555,7 +567,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
+    NONE, METRICS, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
@@ -608,6 +620,8 @@ private:
   std::shared_ptr<HttpIoShard> shard_;
   beast::tcp_stream stream_;
   LuxirNode& node_;
+  // Session destruction can lag server shutdown on a task-arena thread.
+  std::shared_ptr<Metrics> metrics;
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
   beast::flat_buffer buffer_;
@@ -632,6 +646,34 @@ private:
   std::string tenant_;
   std::vector<UrlParam> urlParams_;
   RouteMatch route_;
+  MetricScope requestMetric;
+  std::atomic<bool> metricFailed{false};
+
+  void startRequestMetric() {
+    metricFailed.store(false, std::memory_order_relaxed);
+    MetricOperation operation = MetricOperation::OTHER;
+    switch (route_.route) {
+      case Route::METRICS: return; // Scrapes do not create service traffic.
+      case Route::SEARCH: operation = MetricOperation::SEARCH; break;
+      case Route::UPDATE: operation = MetricOperation::UPDATE; break;
+      case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
+      case Route::STATS: operation = MetricOperation::STATS; break;
+      case Route::HEALTH: operation = MetricOperation::HEALTH; break;
+      case Route::TENANT_LIST: case Route::COLLECTION_LIST:
+      case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE:
+        operation = MetricOperation::COLLECTIONS; break;
+      case Route::REPLICATION_STATUS: case Route::REPLICATION_WATCH:
+      case Route::REPLICATION_SNAPSHOT: case Route::REPLICATION_FILE:
+      case Route::REPLICATION_INSTALLED: return;
+      default: break;
+    }
+    requestMetric.begin(&metrics->request(MetricTransport::HTTP, operation));
+  }
+  void finishRequestMetric() {
+    requestMetric.finish(metricFailed.load(std::memory_order_relaxed)
+        ? MetricOutcome::ERROR : MetricOutcome::OK);
+  }
+
   UpdateUrlParams updateUrl_;
   bool pretty_ = false;  // fixed before submitting work for this request
 
@@ -775,6 +817,7 @@ private:
     if (const std::string* id = findParam(params, "request_id")) requestId_ = *id;
 
     route_ = matchRoute(target);
+    startRequestMetric();
     // The request's scope is settled with its route, before the buffered and
     // streaming paths split; nothing carries over from an earlier request.
     tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
@@ -853,6 +896,7 @@ private:
     if (ec && !needBuffer) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
 
     std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
+    metrics->receivedBytes[0].fetch_add(produced, std::memory_order_relaxed);
     bufferedBody_.append(bodyBuf_.data(), produced);
 
     if (parser_->is_done()) {
@@ -1275,7 +1319,9 @@ private:
 
   static RouteMatch matchUnscopedRoute(std::string_view target) {
     RouteMatch m;
-    if (target == "/health") {
+    if (target == "/metrics") {
+      m.route = Route::METRICS; m.allow = "GET";
+    } else if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
     } else if (target == "/collections/_list") {
       // The canonical _list spelling also accepts POST (matching the other
@@ -1360,6 +1406,10 @@ private:
 
     const std::string& coll = match.coll;
     switch (match.route) {
+      case Route::METRICS:
+        try { respondSimple(http::status::ok, "text/plain; version=0.0.4; charset=utf-8", prometheusMetrics(node_)); }
+        catch (const std::exception& e) { respondException(e, ErrorKind::INTERNAL); }
+        break;
       case Route::TENANT_LIST: handleTenantList(); break;
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
@@ -1693,6 +1743,8 @@ private:
           net::post(target->stream_.get_executor(), [target, guard, result] {
             try {
               std::string out;
+              if (result->response.status != api::UpdateResponse_::Status::OK)
+                target->metricError(result->response.error ? (ErrorKind)result->response.error->kind : ErrorKind::INVALID_REQUEST);
               if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
               target->respondJson(http::status::ok, std::move(out));
             } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
@@ -2335,6 +2387,7 @@ private:
     if (!match.hint.empty()) message += "; " + std::string(match.hint);
     ErrorInfo info{ErrorKind::INVALID_REQUEST, "method_not_allowed", std::move(message)};
     std::string_view allow = match.allow;
+    metricError(ErrorKind::INVALID_REQUEST);
     auto resp = std::make_shared<http::response<http::string_body>>(
         http::status::method_not_allowed, httpVersion_);
     resp->set(http::field::server, "luxir");
@@ -2342,10 +2395,12 @@ private:
     resp->set(http::field::allow, allow);
     resp->keep_alive(keepAlive_);
     resp->body() = finishJson(renderErrorBody(info, requestId_));
+    if (route_.route != Route::METRICS) metrics->sentBytes[0].fetch_add(resp->body().size(), std::memory_order_relaxed);
     resp->prepare_payload();
     http::async_write(stream_, *resp,
         [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
           if (ec) { self->doClose(); return; }
+          self->finishRequestMetric();
           if (resp->keep_alive()) self->doRead();
           else self->doClose();
         });
@@ -2632,6 +2687,7 @@ private:
     }
 
     std::size_t produced = state->readBuf.size() - parser_->get().body().size;
+    metrics->receivedBytes[0].fetch_add(produced, std::memory_order_relaxed);
     if (produced > 0) {
       state->framer.feed(std::string_view(state->readBuf.data(), produced));
       if (state->framer.error()) {
@@ -2748,6 +2804,8 @@ private:
     if (!force && !streamIntervalHasActivity(*state)) return true;
 
     std::string out;
+    for (const auto& [name, result] : state->interval.commits)
+      if (result.error) metricError(result.error->kind);
     if (!renderStreamIntervalResponseBody(*state, currentStreamResponseRequestId(*state), nullptr, out)) {
       failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "failed to serialize update response"));
       return false;
@@ -2762,6 +2820,7 @@ private:
   // Ends the stream with `failure`: the terminal response line when the
   // chunked response has begun, a plain HTTP error otherwise.
   void failStreamingUpdate(ErrorInfo failure) {
+    metricError(failure.kind);
     auto state = streamUpdate_;
     if (state && state->failed) return;
     std::size_t docsIndexed = state ? state->docsIndexedSoFar : 0;
@@ -3256,6 +3315,8 @@ private:
   }
 
   void foldStreamBatchResult(const HttpStreamBatchResult& result) {
+    if (result.error) metricError(result.error->kind);
+    else if (!result.errors.empty()) metricError(result.errors.front().error.kind);
     auto state = streamUpdate_;
     assert(state != nullptr);
     auto& interval = state->interval;
@@ -3578,6 +3639,7 @@ private:
   }
 
   void finishResponse() {
+    finishRequestMetric();
     if (keepAlive_) {
       // Reset streaming state and serve the next request on this connection.
       res_.reset();
@@ -3598,6 +3660,8 @@ private:
 
   void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
     stopWaitDisconnect();
+    if ((unsigned)status >= 400) metricError();
+    if (route_.route != Route::METRICS) metrics->sentBytes[0].fetch_add(body.size(), std::memory_order_relaxed);
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
@@ -3610,6 +3674,7 @@ private:
         else self->doClose();
         return;
       }
+      self->finishRequestMetric();
       if (resp->keep_alive()) self->doRead();
       else if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
       else self->doClose();
@@ -3625,6 +3690,7 @@ private:
   // object an in-band error line carries.
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
   void respondError(const ErrorInfo& info, std::string_view requestId, bool head = false) {
+    metricError(info.kind);
     respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head);
   }
   // An unread body cannot be reused as the next request. Answer, then close.
@@ -3650,6 +3716,7 @@ private:
   }
 
   void doClose() {
+    requestMetric.finish(MetricOutcome::CANCELLED);
     waitCancellation.request_stop();
     replicationStopped_ = true;
     cancelReplicationWatch();
@@ -3658,6 +3725,7 @@ private:
   }
 
   void doTerminalStreamingClose() {
+    requestMetric.finish(MetricOutcome::ERROR);
     waitCancellation.request_stop();
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
@@ -3696,6 +3764,7 @@ void HttpSession::run() {
 }
 
 SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
+  if (response.proto.error) session->metricError((ErrorKind)response.proto.error->kind);
   if (format == HttpSearchFormat::DOCS) return replyDocs(response);
   // The line is rendered into an owned string, so once it is enqueued the proto
   // (and its arena) are dead weight - free them eagerly here instead of deferring
@@ -3714,7 +3783,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
       int64_t queued = session->enqueueJson(
           renderSearchResponseBody(response.proto, requestState->proto.json_shorthand), last);
       outputCommitted = true;
-      if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+      if (queued > session->highWater()) { session->metricPause(); status = ReplyStatus::PAUSE; }
     }
   } catch (...) {
     failDelivery(response);
@@ -3780,7 +3849,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
         // the queue back, and the error path must then still be free to answer
         // with a plain HTTP error rather than abort a stream that never began.
         outputCommitted = true;
-        if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+        if (queued > session->highWater()) { session->metricPause(); status = ReplyStatus::PAUSE; }
       }
     }
   } catch (...) {
@@ -3936,11 +4005,13 @@ void HttpServer::spawnShard(std::size_t idx) {
 
   shard->thread = std::thread([this, shard, idx] {
     runningShardThreads.fetch_add(1, std::memory_order_relaxed);
+    node.metrics->httpThreads.fetch_add(1, std::memory_order_relaxed);
     char name[16];
     snprintf(name, sizeof(name), "luxir_http_%zu", idx);
     nameThisThread(name);
     shard->ioc.run();
     runningShardThreads.fetch_sub(1, std::memory_order_relaxed);
+    node.metrics->httpThreads.fetch_sub(1, std::memory_order_relaxed);
     net::post(acceptIoc, [this, idx] { shardExited(idx); });
   });
 }

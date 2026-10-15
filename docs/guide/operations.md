@@ -230,6 +230,117 @@ Set log verbosity with:
 Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
 `critical`. Startup logs include the loaded time-zone database version.
 
+## Prometheus monitoring
+
+`GET /metrics` on the HTTP port exports Prometheus text format 0.0.4. It is
+available whenever the HTTP server is enabled, including on read-only nodes.
+No exporter process or extra runtime dependency is required. This endpoint has
+the same network access boundary as the administration API and includes host
+information and tenant/collection names.
+
+```yaml
+scrape_configs:
+  - job_name: luxir
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:9400"]
+```
+
+Prometheus supplies `up`, `job`, and `instance`. Aggregate service traffic over
+instances; retain `instance` when diagnosing a specific node. `/metrics` scrapes
+are excluded from service request totals and application response-byte counts.
+Health checks are counted under `operation="health"`.
+
+### Service and engine metrics
+
+| Metric or family | Meaning |
+| --- | --- |
+| `luxir_requests_total`, `luxir_requests_in_flight`, `luxir_requests_duration_seconds` | HTTP requests or gRPC calls, by `transport`, bounded `operation`, and completion `outcome`. Duration includes body reception after HTTP headers, execution, waits, and response delivery. A gRPC stream is one call, regardless of its message count. |
+| `luxir_request_errors_total` | First application failure per request/call, by transport and fixed error `kind`; includes errors carried inside successful transport responses. |
+| `luxir_received_body_bytes_total`, `luxir_response_body_bytes_total` | Application payload throughput; excludes transport framing. Response bytes are counted when submitted for sending, even if delivery subsequently fails. |
+| `luxir_search_total`, `luxir_search_in_flight`, `luxir_search_duration_seconds` | Engine search requests, including individual messages on a gRPC stream. Ends when the final response is handed to the transport. |
+| `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
+| `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
+| `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batches_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. |
+| `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
+| `luxir_stream_pauses_total` | Response backpressure events by transport. |
+| `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
+| `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
+| `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
+| `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, and pending merge demand. The budget is soft; pending demand is capped at that budget when limited. |
+| `luxir_storage_ram_bytes`, `luxir_storage_ram_limit_bytes` | RAM storage consumption and its cap, separate from filesystem usage. |
+| `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
+| `luxir_collections`, `luxir_collection_available` | Collection availability. An available HTTP endpoint does not imply every collection is usable. |
+| `luxir_index_documents`, `luxir_index_segments`, `luxir_index_uncommitted_segments` | Flushed segment document/segment state; excludes documents still buffered in inverters. |
+| `luxir_index_committed_bytes`, `luxir_index_last_commit_timestamp_seconds` | Current snapshot descriptor bytes and publication timestamp. Bytes exclude temporary/retained files; an old timestamp alone does not indicate a problem on an idle collection. |
+| `luxir_inverters`, `luxir_merge_tasks` | Busy, idle, and flushing inverters; outstanding merge work includes queued tasks. |
+| `luxir_filter_cache_*` | Hit/miss counters, builds, admissions, rejections, evictions, purges, bypasses, payload/metadata memory, and payload budget. |
+| `luxir_snapshot_pins`, `luxir_snapshot_retained_bytes` | Current pins and retired files held by those pins. Scraping does not expire pins or remove files. |
+| `luxir_build_info`, `luxir_node_read_only` | Build version and read-only configuration. |
+
+Counters reset when their owner restarts. Collection cache counters also reset
+on recreation or explicit cache-control `reset_counters`; use `rate()` or
+`increase()` rather than subtracting raw samples. Histograms use seconds and
+cumulative buckets, including `+Inf`; compute fleet percentiles from aggregated
+buckets, not averages of node percentiles.
+
+Collection metrics use `tenant` and `collection` labels. There are no labels
+for raw URLs, query text, field names, document IDs, commit IDs, or segment IDs.
+For installations with many collections, `--no-metrics.collections` disables
+per-collection series and their metadata gathering, retaining collection counts
+and node/service metrics. Scrapes read in-memory index metadata without listing
+index directories, loading readers, or opening segment files.
+
+### Process and system metrics
+
+Linux collectors are enabled by default. `--no-metrics.system` disables them
+when equivalent metrics are already collected elsewhere. The counters describe
+the kernel views available to the Luxir process:
+
+| Family | Coverage |
+| --- | --- |
+| `process_*` | CPU time, thread count, resident/virtual/anonymous/file/shared/swap/peak memory, open descriptors and soft descriptor limit, start time, voluntary/involuntary context switches, minor/major page faults, storage bytes, and I/O syscall bytes/counts. Context switches and CPU cover all process threads. |
+| `node_cpu_seconds_total`, `node_load*`, `node_procs_*`, `node_forks_total`, `node_context_switches_total`, `node_boot_time_seconds` | CPU modes per logical CPU, load averages, runnable/blocked tasks, task creation, context switches, and boot time. |
+| `node_memory_*_bytes`, `node_vmstat_*_total` | Total/available/free memory, page cache, swap, dirty/writeback pages, kernel/slab memory, faults, swap events, and OOM kills where supported. |
+| `node_filefd_*` | Host-wide allocated file handles and their limit. |
+| `node_network_*_total`, `node_netstat_Tcp_*` | Per-interface bytes/packets/errors/drops and TCP established connections, retransmissions, resets, input errors, and failed attempts. These describe the network namespace, not just Luxir traffic. |
+| `node_disk_*` | Every visible block device's read/write bytes, operations, merges, cumulative latency, I/O in progress, busy time, and weighted I/O time. Device and partition counters overlap; do not sum them indiscriminately. |
+| `luxir_data_filesystem_*` | The configured filesystem data directory's capacity, free/available bytes, total/free inodes, read-only state, and stat errors. Only emitted for filesystem storage. Arbitrary remote mounts are not probed. |
+| `node_pressure_stall_seconds_total` | CPU, memory, and I/O pressure stall time, with `some`/`full` labels where supported. |
+| `luxir_cgroup_*` | Current cgroup v2 memory usage/high/max, task count/limit, memory pressure/OOM events, CPU time/quota, and CPU throttling time/periods. Memory includes page cache and descendants. |
+
+In containers, host CPU/memory/disk views can be broader than the container;
+network counters follow its network namespace. Cgroup metrics locate this
+process's membership using procfs and the cgroup mount. They report **local**
+limits; ancestor cgroups can impose stricter limits. A cgroup limit of `-1`
+means unlimited. Cgroup v1 is not supported by this collector.
+
+`luxir_metrics_collector_success{collector="..."}` is zero when a source is
+unavailable, unsupported, or unreadable. Missing measurements are omitted, not
+reported as zero. Some earlier measurements from that collector may still be
+present. Restricted procfs, disabled PSI, and absent cgroup controllers are
+common reasons. `luxir_metrics_collection_errors` counts collection rows that
+could not be read, including deletion races; other rows remain available.
+`luxir_metrics_collection_duration_seconds` measures collection overhead.
+
+Useful initial alerts are: scrape failures, unavailable collections, rising
+internal/unavailable errors, p99 latency above the service target, sustained
+indexing-memory pressure, filesystem byte/inode exhaustion, descriptor usage
+near its limit, cgroup OOM events/throttling, and failed background stages.
+For example, aggregate HTTP search p99 across nodes with:
+
+```promql
+histogram_quantile(0.99,
+  sum by (le) (rate(luxir_requests_duration_seconds_bucket{
+    transport="http", operation="search"
+  }[5m]))
+)
+```
+
+There are no replication metrics in this exporter. Search admission queues,
+deadline-driven partial results, and checksum scrubbing are not implemented on
+this revision, so the exporter does not invent metrics for those features.
+
 ## Threads and streaming backpressure
 
 HTTP defaults to one connection-I/O shard per available logical CPU, with a
