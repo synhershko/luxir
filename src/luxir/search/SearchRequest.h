@@ -4,6 +4,7 @@
 #pragma once
 
 #include <stop_token>
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <functional>
@@ -81,6 +82,7 @@ struct ExecutionProfileOpState {
 class Collection;
 class SearchRequest {
   friend class SearchEngine;
+  MetricScope metric;
 
 public:
   // Fires when the client goes away (or the node shuts down): ends a

@@ -66,10 +66,13 @@ static void attachWarnings(SearchRequest& req) {
   }
 }
 
+Metrics& SearchEngine::metrics() const { return *node.metrics; }
+
 void SearchEngine::submitBody(SearchRequest& req) {
   // Window loops reach the budget through the thread; task_group_run carries
   // it into the tasks this body spawns.
   ExecutionBudget::Scope budgetScope(&req.budget);
+  auto metricStart = std::chrono::steady_clock::now();
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
@@ -123,6 +126,8 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  node.metrics->searchExecution.observe(std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - metricStart).count());
   req.bodyDone();
 }
 
