@@ -1626,6 +1626,21 @@ message SchemaDef {
   // example "_stored_" or "_stored_body_"). A group without an entry uses the
   // defaults. mode=set replaces the named entries and keeps the others.
   map<string, StoredResourceDef> stored_resources = 4;
+
+  // Merge source order. Absent in a SET request keeps the current setting;
+  // present with an empty field clears it. Changes affect future merges only.
+  IndexSort index_sort = 3;
+
+  // A merge concatenates its source segments in ascending order of each
+  // source's minimum value of this field instead of segment creation order.
+  // Documents within a source keep their arrival order. When segments are
+  // flushed out of time order, this keeps a merged segment roughly sorted by
+  // time, so column zones stay tight for range pruning and descending time
+  // sorts. Sources without values for the field go last.
+  message IndexSort {
+    // A concrete field or template instance of type int or date with a column.
+    string field = 1;
+  }
 }
 
 message SchemaRequest {

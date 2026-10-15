@@ -145,6 +145,7 @@ defaults and constraints are described in the comments and guides.
 - [`RescoreQuery`](#message-luxir.rescorequery)
 - [`RrfFusion`](#message-luxir.rrffusion)
 - [`SchemaDef`](#message-luxir.schemadef)
+- [`SchemaDef.IndexSort`](#message-luxir.schemadef.indexsort)
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
 - [`ScrubStats`](#message-luxir.scrubstats)
@@ -1444,6 +1445,19 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource (for example "\_stored\_" or "\_stored\_body\_"). A group without an entry uses the defaults. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.index_sort"></a>[`index_sort`](#field-luxir.schemadef.index_sort) | 3 | [`SchemaDef.IndexSort`](#message-luxir.schemadef.indexsort) | singular | Merge source order. Absent in a SET request keeps the current setting; present with an empty field clears it. Changes affect future merges only. |
+
+<a id="message-luxir.schemadef.indexsort"></a>
+
+### luxir.SchemaDef.IndexSort
+
+A merge concatenates its source segments in ascending order of each source's minimum value of this field instead of segment creation order. Documents within a source keep their arrival order. When segments are flushed out of time order, this keeps a merged segment roughly sorted by time, so column zones stay tight for range pruning and descending time sorts. Sources without values for the field go last.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.schemadef.indexsort.field"></a>[`field`](#field-luxir.schemadef.indexsort.field) | 1 | `string` | singular | A concrete field or template instance of type int or date with a column. |
 
 <a id="message-luxir.schemarequest"></a>
 

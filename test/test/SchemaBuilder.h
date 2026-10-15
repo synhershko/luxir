@@ -35,6 +35,7 @@ class SchemaBuilder {
   std::vector<Pair> fieldsFlat_;
   std::vector<Pair> templatesFlat_;
   std::vector<std::pair<std::string_view, api::StoredResourceDef>> resources_;
+  std::optional<api::SchemaDef::IndexSort> indexSort_;
 
   api::FieldDef& add(std::deque<Pair>& out, std::string_view name) {
     auto* def = api::build::allocMessage<api::FieldDef>(arena_);
@@ -84,6 +85,9 @@ public:
     return f;
   }
 
+  // Set SchemaDef.index_sort; an empty field clears it in a SET.
+  void indexSort(std::string_view field) { indexSort_.emplace().field = api::build::arenaStr(arena_, field); }
+
   // The built def views this builder's storage; keep the builder alive while using it.
   api::SchemaDef def() {
     fieldsFlat_.assign(fields_.begin(), fields_.end());
@@ -95,6 +99,7 @@ public:
       std::span<const Pair>(templatesFlat_.data(), templatesFlat_.size()));
     d.stored_resources = api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const std::pair<std::string_view, api::StoredResourceDef>>(resources_.data(), resources_.size()));
+    d.index_sort = indexSort_;
     return d;
   }
 
