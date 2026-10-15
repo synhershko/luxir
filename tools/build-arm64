@@ -82,7 +82,7 @@ cmake_bin=${LUXIR_CMAKE:-"$VCPKG_DOWNLOADS/tools/cmake-4.4.3-linux/cmake-4.4.3-l
 # CMake caches the compiler path independently of the toolchain environment.
 # Reset configuration when running this workflow so toolchain changes take effect.
 stage configure "$cmake_bin" --fresh --preset arm64-release -DLUXIR_COMPILE_JOBS="$VCPKG_MAX_CONCURRENCY"
-stage build "$cmake_bin" --build --preset arm64-release
+stage build "$cmake_bin" --build --preset arm64-release ${LUXIR_BUILD_TARGET:+--target "$LUXIR_BUILD_TARGET"}
 if [[ -n $qemu ]]; then
     stage binary-execute "$qemu" -cpu cortex-a53 -L "$LUXIR_ARM64_SYSROOT" \
         build/arm64-release/bin/luxir --version
