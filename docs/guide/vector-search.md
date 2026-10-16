@@ -93,6 +93,9 @@ A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
 
+An optional `ann` object chooses how [approximate indexes](#index-settings)
+for the field are built; the defaults suit most embedding models.
+
 ### Truncate Matryoshka embeddings
 
 Some embedding models are trained with
@@ -216,9 +219,6 @@ the exact input.
 Existing segments keep the encoding they were written with, and a merge of
 segments with different encodings writes the most precise of them, so a merge
 never loses precision. To re-encode existing data, reindex it.
-
-An optional `ann` object chooses how [approximate indexes](#index-settings)
-for the field are built; the defaults suit most embedding models.
 
 ## Index vectors
 
