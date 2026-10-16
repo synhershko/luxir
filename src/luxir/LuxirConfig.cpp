@@ -131,10 +131,6 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->check(CLI::NonNegativeNumber)
       ->default_str("--indexing.max-request-body");
 
-  app.add_flag("--metrics.collections,!--no-metrics.collections", metrics.collections,
-      "Expose per-collection Prometheus index and cache metrics")->default_val(metrics.collections);
-  app.add_flag("--metrics.system,!--no-metrics.system", metrics.system,
-      "Expose Linux process and system metrics at /metrics")->default_val(metrics.system);
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);
   // -p is the HTTP port: the HTTP/JSON API is the surface developers hit first.

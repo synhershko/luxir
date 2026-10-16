@@ -497,7 +497,6 @@ public:
   }
 
   void metricError(ErrorKind kind = ErrorKind::UNKNOWN) {
-    if (route_.route == Route::METRICS) return;
     if (!metricFailed.exchange(true, std::memory_order_relaxed))
       metrics->errors[0][(size_t)kind].fetch_add(1, std::memory_order_relaxed);
   }
@@ -672,7 +671,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, METRICS, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
@@ -758,7 +757,6 @@ private:
     metricFailed.store(false, std::memory_order_relaxed);
     MetricOperation operation = MetricOperation::OTHER;
     switch (route_.route) {
-      case Route::METRICS: return; // Scrapes do not create service traffic.
       case Route::SEARCH: operation = MetricOperation::SEARCH; break;
       case Route::UPDATE: operation = MetricOperation::UPDATE; break;
       case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
@@ -1461,9 +1459,7 @@ private:
 
   static RouteMatch matchUnscopedRoute(std::string_view target) {
     RouteMatch m;
-    if (target == "/metrics") {
-      m.route = Route::METRICS; m.allow = "GET";
-    } else if (target == "/health") {
+    if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
     } else if (target == "/collections/_list") {
       // The canonical _list spelling also accepts POST (matching the other
@@ -1548,10 +1544,6 @@ private:
 
     const std::string& coll = match.coll;
     switch (match.route) {
-      case Route::METRICS:
-        try { respondSimple(http::status::ok, "text/plain; version=0.0.4; charset=utf-8", prometheusMetrics(node_)); }
-        catch (const std::exception& e) { respondException(e, ErrorKind::INTERNAL); }
-        break;
       case Route::TENANT_LIST: handleTenantList(); break;
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
@@ -1631,18 +1623,24 @@ private:
         handleUpdate(std::move(req.body()), coll, updateUrl_);
         break;
       case Route::STATS: {
-        bool includeSegments = false;
-        bool includeMemory = false;
+        StatsParams stats;
         std::string err;
-        if (!parseBoolParam(params, "segments", includeSegments, err) ||
-            !parseBoolParam(params, "memory", includeMemory, err)) {
+        const std::string* format = findParam(params, "format");
+        if (format && *format != "json" && *format != "prometheus") {
+          err = "invalid URL parameter 'format': expected json or prometheus, got '" + *format + "'";
+        }
+        if (!err.empty() ||
+            !parseBoolParam(params, "segments", stats.segments, err) ||
+            !parseBoolParam(params, "collections", stats.collections, err) ||
+            !parseBoolParam(params, "files", stats.files, err) ||
+            !parseBoolParam(params, "system", stats.system, err)) {
           respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
           return;
         }
+        stats.prometheus = format && *format == "prometheus";
         // /_stats covers every tenant; a tenant route or a collection is scoped.
         handleStats(coll.empty() ? std::nullopt : std::optional<std::string>(coll),
-                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(),
-                    includeSegments, includeMemory);
+                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(), stats);
         break;
       }
       case Route::SCHEMA: {
@@ -2503,26 +2501,36 @@ private:
     });
   }
 
-  void handleStats(std::optional<std::string> coll, std::string tenant, bool includeSegments,
-                   bool includeMemory) {
+  struct StatsParams {
+    bool segments = false;
+    bool collections = false;
+    bool files = false;
+    bool system = false;
+    bool prometheus = false;
+  };
+
+  void handleStats(std::optional<std::string> coll, std::string tenant, StatsParams params) {
     auto shardPin = makeShardPin();
     enqueue(
-        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), includeSegments,
-         includeMemory, shardPin] {
+        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), params, shardPin] {
           std::string out;
           std::optional<ErrorInfo> failure;
           try {
             std::pmr::monotonic_buffer_resource resource;
             luxir::api::StatsRequest request;
-            request.segments = includeSegments;
-            request.memory = includeMemory;
+            request.segments = params.segments;
+            request.collections = params.collections;
+            request.files = params.files;
+            request.system = params.system;
             request.tenant = tenant;
             if (coll) request.collection = *coll;
 
             luxir::api::StatsResponse response;
             gatherStats(self->node_, request, response, resource);
 
-            if (!luxir::api::write_json(response, out)) {
+            if (params.prometheus) {
+              out = renderPrometheus(response, params.files || params.segments);
+            } else if (!luxir::api::write_json(response, out)) {
               throw std::runtime_error("failed to serialize stats response");
             }
           } catch (const std::exception& e) {
@@ -2530,8 +2538,10 @@ private:
           }
 
           self->post(
-                    [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
+                    [self, shardPin, failure = std::move(failure), body = std::move(out),
+                     prometheus = params.prometheus]() mutable {
                       if (failure) self->respondError(*failure);
+                      else if (prometheus) self->respondSimple(http::status::ok, prometheusContentType, std::move(body));
                       else self->respondJson(http::status::ok, std::move(body));
                     });
         });
@@ -2598,7 +2608,7 @@ private:
     resp->set(http::field::allow, allow);
     resp->keep_alive(keepAlive_);
     resp->body() = finishJson(renderErrorBody(info, requestId_));
-    if (route_.route != Route::METRICS) metrics->sentBytes[0].fetch_add(resp->body().size(), std::memory_order_relaxed);
+    metrics->sentBytes[0].fetch_add(resp->body().size(), std::memory_order_relaxed);
     resp->prepare_payload();
     outputStarted_ = true;
     http::async_write(stream_, *resp,
@@ -3911,7 +3921,7 @@ private:
   void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
     stopWaitDisconnect();
     if ((unsigned)status >= 400) metricError();
-    if (route_.route != Route::METRICS) metrics->sentBytes[0].fetch_add(body.size(), std::memory_order_relaxed);
+    metrics->sentBytes[0].fetch_add(body.size(), std::memory_order_relaxed);
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);

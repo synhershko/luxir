@@ -2,26 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include <map>
+#include <span>
 #include <string>
 #include <string_view>
-#include "luxir/util/Metrics.h"
+#include "luxir/api/luxir_types.hpp"
 
 namespace luxir {
-class LuxirNode;
 
-// Groups families so HELP/TYPE appear once, before all samples of a family.
+// Prometheus text exposition format 0.0.4. Groups families so HELP/TYPE
+// appear once, before all samples of a family.
 class PrometheusText {
   struct Family { std::string help, type, samples; };
   std::map<std::string, Family, std::less<>> families;
+  Family& family(std::string_view name, std::string_view help, std::string_view type);
 public:
   static std::string label(std::string_view key, std::string_view value);
   void sample(std::string_view name, std::string_view help, std::string_view type,
               double value, std::string_view labels = {});
-  void histogram(std::string_view name, std::string_view help,
-                 const MetricHistogram& histogram, std::string_view labels = {});
+  void histogram(std::string_view name, std::string_view help, std::span<const double> bounds,
+                 const api::HistogramStats& histogram, std::string_view labels = {});
   std::string str() const;
 };
 
-void collectSystemMetrics(PrometheusText& text, std::string_view dataDirectory);
-std::string prometheusMetrics(LuxirNode& node);
+inline constexpr std::string_view prometheusContentType = "text/plain; version=0.0.4; charset=utf-8";
+
+// Render a gathered stats response (see gatherStats). Every sample comes from
+// the response, so the JSON and Prometheus formats carry the same data.
+// `files` reports whether the response was gathered with directory listings.
+std::string renderPrometheus(const api::StatsResponse& stats, bool files);
 } // namespace luxir

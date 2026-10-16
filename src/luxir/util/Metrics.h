@@ -7,13 +7,13 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
-#include <mutex>
 #include <string_view>
 
 namespace luxir {
 
-// Fixed dimensions: requests cannot manufacture metric series. No allocations,
-// label lookups or shared registry locks on the request path.
+// Process-wide service counters, reported by _stats. Fixed dimensions:
+// requests cannot manufacture series. No allocations, label lookups or locks
+// on the request path.
 enum class MetricOperation { SEARCH, UPDATE, SCHEMA, COLLECTIONS, STATS, HEALTH, OTHER, COUNT };
 enum class MetricTransport { HTTP, GRPC, COUNT };
 enum class MetricOutcome { OK, ERROR, CANCELLED, COUNT };
@@ -30,19 +30,22 @@ public:
     double sum = 0;
   };
 private:
-  mutable std::mutex mutex;
-  Snapshot value;
+  std::array<std::atomic<uint64_t>, bounds.size() + 1> buckets{};
+  std::atomic<double> sum{0};
 public:
   void observe(double seconds) noexcept {
-    std::lock_guard lock(mutex);
     size_t bucket = 0;
     while (bucket < bounds.size() && seconds > bounds[bucket]) ++bucket;
-    ++value.buckets[bucket];
-    value.sum += seconds;
+    buckets[bucket].fetch_add(1, std::memory_order_relaxed);
+    sum.fetch_add(seconds, std::memory_order_relaxed);
   }
+  // Buckets are read individually, so a snapshot taken during observe() may
+  // be off by one observation between the count and the sum.
   Snapshot snapshot() const {
-    std::lock_guard lock(mutex);
-    return value;
+    Snapshot out;
+    for (size_t i = 0; i < buckets.size(); ++i) out.buckets[i] = buckets[i].load(std::memory_order_relaxed);
+    out.sum = sum.load(std::memory_order_relaxed);
+    return out;
   }
 };
 

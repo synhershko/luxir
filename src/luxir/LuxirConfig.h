@@ -229,10 +229,6 @@ struct LuxirConfig {
   IndexConfig index;
   IngestConfig ingest;
   SearchConfig search;
-  struct MetricsConfig {
-    bool collections = true;
-    bool system = true;
-  } metrics;
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);
