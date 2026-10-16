@@ -839,6 +839,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
 | <a id="field-luxir.fielddef.index_options"></a>[`index_options`](#field-luxir.fielddef.index_options) | 17 | [`FieldDef.IndexOptions`](#enum-luxir.fielddef.indexoptions) | optional | absent: inherit from parent, else positions |
 | <a id="field-luxir.fielddef.norms"></a>[`norms`](#field-luxir.fielddef.norms) | 18 | `bool` | optional | TEXT only: keep per-document length norms for BM25. false scores every document as if it had the average field length. Requires FREQS or POSITIONS. Absent: inherit from parent, else true (false at DOCS). |
+| <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. dims stays the input dimension; the column, ANN overlays and kNN scoring use truncate\_dims. COSINE fields renormalize the prefix (normalized=true is rejected); L2 and IP keep it as-is. Must be positive and &lt; dims when dims is set. Unset inherits, falling back to 0 (no truncation). |
 
 <a id="message-luxir.fielddefaults"></a>
 
