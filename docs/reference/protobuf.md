@@ -173,6 +173,9 @@ defaults and constraints are described in the comments and guides.
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
 - [`Val`](#message-luxir.val)
 - [`Vector`](#message-luxir.vector)
+- [`VectorAnnDef`](#message-luxir.vectoranndef)
+- [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq)
+- [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
@@ -842,6 +845,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. dims stays the input dimension; the column, ANN overlays and kNN scoring use truncate\_dims. COSINE fields renormalize the prefix (normalized=true is rejected); L2 and IP keep it as-is. Must be positive and &lt; dims when dims is set. Unset inherits, falling back to 0 (no truncation). |
 | <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to F32. F16 and INT8 reject non-finite elements; F16 also rejects magnitudes above 65504. Applies to newly written segments. |
 | <a id="field-luxir.fielddef.keep_original"></a>[`keep_original`](#field-luxir.fielddef.keep_original) | 21 | `bool` | optional | VECTOR only. Also keep the submitted float32 vectors in a separate cold column that searches never read, so the field can be re-encoded later. Unset inherits, falling back to false. |
+| <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1937,6 +1941,43 @@ A dense vector value. Dimensionality is the number of elements in f32.v.
 |---|---|---|---|---|
 | <a id="field-luxir.vector.f32"></a>[`f32`](#field-luxir.vector.f32) | 1 | [`ArrFloat`](#message-luxir.arrfloat) | oneof [`kind`](#oneof-luxir.vector.kind) |  |
 
+<a id="message-luxir.vectoranndef"></a>
+
+### luxir.VectorAnnDef
+
+Approximate nearest-neighbor index settings for a VECTOR field: the codec and parameters of the per-segment IVF overlays built at commit and merge. Read when an overlay is built; each overlay records what it was built with, so a change applies to segments built afterwards. See docs/guide/vector-search.md#index-settings.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: rabitq |
+| <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
+| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | codec rabitq only |
+| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq only |
+
+<a id="message-luxir.vectoranndef.pq"></a>
+
+### luxir.VectorAnnDef.Pq
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers; must divide dims. Absent or 0: the largest divisor of dims up to 32 that leaves at least 4 dimensions per sub-quantizer. |
+| <a id="field-luxir.vectoranndef.pq.bits"></a>[`bits`](#field-luxir.vectoranndef.pq.bits) | 2 | `int32` | optional | bits per sub-quantizer code, 1..8. Absent: 8. |
+
+<a id="message-luxir.vectoranndef.rabitq"></a>
+
+### luxir.VectorAnnDef.RaBitQ
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.rabitq.bits"></a>[`bits`](#field-luxir.vectoranndef.rabitq.bits) | 1 | `int32` | optional | Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a 1-bit pass prunes with the error bound and survivors are re-estimated with the extra bits. |
+| <a id="field-luxir.vectoranndef.rabitq.query_bits"></a>[`query_bits`](#field-luxir.vectoranndef.rabitq.query_bits) | 2 | `int32` | optional | Query quantization bits, 0..8; 0 scans with the float query. Absent: 4. Read at search time, so a change applies to existing overlays. |
+
 <a id="message-luxir.warning"></a>
 
 ### luxir.Warning
@@ -1986,6 +2027,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorEncoding`](#enum-luxir.vectorencoding)
+- [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
 <a id="enum-luxir.calendargap.unit"></a>
@@ -2262,6 +2304,17 @@ Storage encoding of a vector field's column. Exact search and the rescoring of A
 | <a id="value-luxir.vectorencoding.f32"></a>[`F32`](#value-luxir.vectorencoding.f32) | 0 | float32 per element (4 bytes per dimension) |
 | <a id="value-luxir.vectorencoding.f16"></a>[`F16`](#value-luxir.vectorencoding.f16) | 1 | IEEE half precision per element (2 bytes per dimension) |
 | <a id="value-luxir.vectorencoding.int8"></a>[`INT8`](#value-luxir.vectorencoding.int8) | 2 | Per-vector scalar quantization: a float offset and scale per vector plus one uint8 code per dimension (8 + dims bytes). |
+
+<a id="enum-luxir.vectoranndef.codec"></a>
+
+### luxir.VectorAnnDef.Codec
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.vectoranndef.codec.rabitq"></a>[`RABITQ`](#value-luxir.vectoranndef.codec.rabitq) | 0 | IVF + RaBitQ (randomly rotated, centroid-relative bit codes) |
+| <a id="value-luxir.vectoranndef.codec.pq"></a>[`PQ`](#value-luxir.vectoranndef.codec.pq) | 1 | IVF + product quantization |
 
 <a id="enum-luxir.vectormetric"></a>
 

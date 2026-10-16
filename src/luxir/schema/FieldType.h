@@ -292,6 +292,27 @@ public:
                               std::span<char> buf) const override;
 };
 
+// Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
+// defaults applied).  Build-time parameters are recorded in each overlay's
+// VectorAuxMeta, so a change only affects overlays built afterwards;
+// rabitqQueryBits is a search-time parameter read from the current schema.
+struct VectorAnnConfig {
+  enum Codec {
+    RABITQ = 0,
+    PQ = 1,
+  };
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
+  static constexpr int32_t DEFAULT_PQ_BITS = 8;
+
+  Codec codec = RABITQ;
+  int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
+  int32_t rabitqBits = DEFAULT_RABITQ_BITS;
+  int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
+  int32_t pqM = 0;    // 0 = derived from dims
+  int32_t pqBits = DEFAULT_PQ_BITS;
+};
+
 // Dense float vector field.  Values are stored as fixed-size byte blobs
 // through the standard binary-column path (see VectorHandler).  inputDims_ may
 // be 0, in which case the first indexed value in a segment fixes the segment's
@@ -329,6 +350,8 @@ public:
   // Also store the submitted float32 vectors in a cold companion column
   // (originalColumnName) that the query path never reads.
   bool keepOriginal_;
+  // ANN overlay codec and parameters (schema "ann").
+  VectorAnnConfig ann_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
@@ -337,7 +360,8 @@ public:
                   bool normalizeOnWrite = true,
                   int32_t truncateDims = 0,
                   VectorEncoding encoding = VectorEncoding::F32,
-                  bool keepOriginal = false)
+                  bool keepOriginal = false,
+                  VectorAnnConfig ann = {})
     : FieldType(name, FieldType::VECTOR, flags),
       inputDims_(dims),
       truncateDims_(truncateDims),
@@ -345,7 +369,8 @@ public:
       normalized_(normalized),
       normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
       encoding_(encoding),
-      keepOriginal_(keepOriginal) {
+      keepOriginal_(keepOriginal),
+      ann_(ann) {
   }
 
   // Physical name of the keep_original companion column.  The '#' makes it an
@@ -375,6 +400,7 @@ public:
   // accept (wrong dims, or shorter than truncate_dims); empty when n is valid.
   // With truncation, a valid input then keeps its first dims() components.
   std::string inputDimsError(size_t n) const;
+  const VectorAnnConfig& ann() const { return ann_; }
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.

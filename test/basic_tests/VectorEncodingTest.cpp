@@ -107,30 +107,8 @@ std::vector<std::string> rows(CollectionHelper& h, std::string_view field,
   return out;
 }
 
-struct IvfPqGuard {
-  bool ivfPq = VectorIndexBuilder::buildFaissIvfPqAuxIndexes;
-  int32_t nlist = VectorIndexBuilder::ivfPqNList;
-  int32_t m = VectorIndexBuilder::ivfPqM;
-  int32_t bits = VectorIndexBuilder::ivfPqBits;
-  int64_t minTraining = VectorIndexBuilder::ivfPqMinTrainingVectors;
-  int64_t threshold = VectorIndexBuilder::ivfPqBuildThresholdScanCost;
-
-  IvfPqGuard() {
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-    VectorIndexBuilder::ivfPqNList = 4;
-    VectorIndexBuilder::ivfPqM = 2;
-    VectorIndexBuilder::ivfPqBits = 2;
-    VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
-    VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-  }
-  ~IvfPqGuard() {
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = ivfPq;
-    VectorIndexBuilder::ivfPqNList = nlist;
-    VectorIndexBuilder::ivfPqM = m;
-    VectorIndexBuilder::ivfPqBits = bits;
-    VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
-    VectorIndexBuilder::ivfPqBuildThresholdScanCost = threshold;
-  }
+struct IvfPqGuard : IvfTestGuard {
+  IvfPqGuard() : IvfTestGuard(pq(/*nlist=*/4, /*m=*/2, /*bits=*/2), /*minTraining=*/16) {}
 };
 
 } // namespace
