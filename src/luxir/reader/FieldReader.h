@@ -109,6 +109,10 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // VECTOR only: the column's VectorEncoding, as written for this segment.
+  // Serialized only for VECTOR fields.
+  int32_t vectorEncoding = 0;
+
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is
   // serialized so adding a new absolute base cannot silently update only one
@@ -257,6 +261,7 @@ public:
       fieldInfo.mono2MetaOff = fieldIS.readVlong();
       fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
       fieldInfo.valDocMetaOff = fieldIS.readVlong();
+      fieldInfo.vectorEncoding = fieldInfo.type == FieldType::VECTOR ? fieldIS.readVint() : 0;
     }
   }
 
