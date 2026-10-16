@@ -258,6 +258,8 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->persistOrdMaps = config.index.persist_ordmaps == "off" ? IndexWriter::OrdMapPersistence::OFF
       : config.index.persist_ordmaps == "all" ? IndexWriter::OrdMapPersistence::ALL
       : IndexWriter::OrdMapPersistence::USED;
+  col->shard->iw->parallelUpdateChunkDocs = (size_t)config.index.parallel_update_chunk_docs;
+  col->shard->iw->parallelUpdateMaxChunks = config.index.parallel_update_max_chunks;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
   if (creating) storage.select(*selected);
   retire(name, *selected);
