@@ -732,6 +732,41 @@ enum SelectionMode {
   ALL = 1;
 }
 
+// Restricts which terms of a STRING or ID field can become ordinary buckets of
+// a FieldFacet. Every set condition must hold (AND). Counts are exact: the
+// filter chooses buckets after counting and never narrows the query domain, so
+// it is not the same as adding a filter to the search. Terms are tested as
+// indexed: prefix, regex, include, and exclude values are normalized the way
+// the field normalizes query text, and ID fields use them verbatim.
+message TermFilter {
+  // Keeps terms starting with this prefix. Empty = unset.
+  string prefix = 1;
+
+  // Keeps terms matching this regular expression in full, with RegexQuery
+  // syntax. Empty = unset.
+  string regex = 2;
+
+  // Drops terms matching this regular expression in full. Empty = unset.
+  string exclude_regex = 3;
+
+  // Applies to regex and exclude_regex, as RegexQuery.case_insensitive.
+  bool case_insensitive = 4;
+
+  // Keeps only these exact terms. An empty list is unset, so it cannot be used
+  // to match nothing.
+  repeated string include = 5;
+
+  // Drops these exact terms.
+  repeated string exclude = 6;
+
+  // Keeps terms whose stable hash (64-bit FNV-1a of the indexed term bytes)
+  // modulo num_partitions equals partition, so num_partitions requests with
+  // partition 0..num_partitions-1 together return every term once. Unset when
+  // num_partitions is 0; otherwise partition must be below num_partitions.
+  uint32 partition = 7;
+  uint32 num_partitions = 8;
+}
+
 // Buckets of distinct field values, using the field's value binding.
 // STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
 // counts, limits, mincount, missing, and selections.
@@ -758,6 +793,13 @@ message FieldFacet {
   // counts, even below mincount or absent from the index. Null is an error.
   Val selected = 7;
   SelectionMode selection_mode = 8; // ALL requires a nonempty selection
+
+  // STRING/ID only. Restricts which terms can be ordinary buckets while counts
+  // stay exact; see TermFilter. It applies to the ordinary page and to
+  // mincount=0 padding. `missing` still counts every document in the domain
+  // without a value, and selected buckets are returned whether or not they
+  // pass the filter.
+  TermFilter term_filter = 9;
 }
 
 message CalendarGap {

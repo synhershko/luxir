@@ -185,6 +185,7 @@ defaults and constraints are described in the comments and guides.
 - [`StoredResourceDef`](#message-luxir.storedresourcedef)
 - [`SystemStats`](#message-luxir.systemstats)
 - [`TcpStats`](#message-luxir.tcpstats)
+- [`TermFilter`](#message-luxir.termfilter)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`TransportStats`](#message-luxir.transportstats)
 - [`UpdateRequest`](#message-luxir.updaterequest)
@@ -1012,6 +1013,7 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.ops"></a>[`ops`](#field-luxir.fieldfacet.ops) | 6 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.fieldfacet.selected"></a>[`selected`](#field-luxir.fieldfacet.selected) | 7 | [`Val`](#message-luxir.val) | singular | Scalar or array of selected values, coerced as AnyOfQuery values. Selected buckets missing from the ordinary page append in input order with exact counts, even below mincount or absent from the index. Null is an error. |
 | <a id="field-luxir.fieldfacet.selection_mode"></a>[`selection_mode`](#field-luxir.fieldfacet.selection_mode) | 8 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | ALL requires a nonempty selection |
+| <a id="field-luxir.fieldfacet.term_filter"></a>[`term_filter`](#field-luxir.fieldfacet.term_filter) | 9 | [`TermFilter`](#message-luxir.termfilter) | singular | STRING/ID only. Restricts which terms can be ordinary buckets while counts stay exact; see TermFilter. It applies to the ordinary page and to mincount=0 padding. \`missing\` still counts every document in the domain without a value, and selected buckets are returned whether or not they pass the filter. |
 
 <a id="message-luxir.fieldmetadatastats"></a>
 
@@ -2216,6 +2218,25 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.tcpstats.in_errs"></a>[`in_errs`](#field-luxir.tcpstats.in_errs) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.tcpstats.out_rsts"></a>[`out_rsts`](#field-luxir.tcpstats.out_rsts) | 4 | `uint64` | singular |  |
 | <a id="field-luxir.tcpstats.attempt_fails"></a>[`attempt_fails`](#field-luxir.tcpstats.attempt_fails) | 5 | `uint64` | singular |  |
+
+<a id="message-luxir.termfilter"></a>
+
+### luxir.TermFilter
+
+Restricts which terms of a STRING or ID field can become ordinary buckets of a FieldFacet. Every set condition must hold (AND). Counts are exact: the filter chooses buckets after counting and never narrows the query domain, so it is not the same as adding a filter to the search. Terms are tested as indexed: prefix, regex, include, and exclude values are normalized the way the field normalizes query text, and ID fields use them verbatim.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.termfilter.prefix"></a>[`prefix`](#field-luxir.termfilter.prefix) | 1 | `string` | singular | Keeps terms starting with this prefix. Empty = unset. |
+| <a id="field-luxir.termfilter.regex"></a>[`regex`](#field-luxir.termfilter.regex) | 2 | `string` | singular | Keeps terms matching this regular expression in full, with RegexQuery syntax. Empty = unset. |
+| <a id="field-luxir.termfilter.exclude_regex"></a>[`exclude_regex`](#field-luxir.termfilter.exclude_regex) | 3 | `string` | singular | Drops terms matching this regular expression in full. Empty = unset. |
+| <a id="field-luxir.termfilter.case_insensitive"></a>[`case_insensitive`](#field-luxir.termfilter.case_insensitive) | 4 | `bool` | singular | Applies to regex and exclude\_regex, as RegexQuery.case\_insensitive. |
+| <a id="field-luxir.termfilter.include"></a>[`include`](#field-luxir.termfilter.include) | 5 | `string` | repeated | Keeps only these exact terms. An empty list is unset, so it cannot be used to match nothing. |
+| <a id="field-luxir.termfilter.exclude"></a>[`exclude`](#field-luxir.termfilter.exclude) | 6 | `string` | repeated | Drops these exact terms. |
+| <a id="field-luxir.termfilter.partition"></a>[`partition`](#field-luxir.termfilter.partition) | 7 | `uint32` | singular | Keeps terms whose stable hash (64-bit FNV-1a of the indexed term bytes) modulo num\_partitions equals partition, so num\_partitions requests with partition 0..num\_partitions-1 together return every term once. Unset when num\_partitions is 0; otherwise partition must be below num\_partitions. |
+| <a id="field-luxir.termfilter.num_partitions"></a>[`num_partitions`](#field-luxir.termfilter.num_partitions) | 8 | `uint32` | singular |  |
 
 <a id="message-luxir.topdocs"></a>
 
