@@ -101,12 +101,11 @@ protected:
     checkedBoostProduct(multiplier, 1.0f);
     if (!fittedPolicy || context.warnings == nullptr) return;
     bool found = false;
+    auto fieldSegments = context.topReader.field(field);
     for (auto& segment : context.topReader.segments()) {
-      FieldReader reader(segment.postingsReader());
-      if (!reader.seek(field)) continue;
-      SegFieldInfo info;
-      reader.readFieldInfo(info);
-      if ((info.flags & FieldType::MAY_HAVE_FITTED) != 0) {
+      const SegFieldInfo* info = fieldSegments.at(segment);
+      if (info == nullptr) continue;
+      if ((info->flags & FieldType::MAY_HAVE_FITTED) != 0) {
         found = true;
         break;
       }

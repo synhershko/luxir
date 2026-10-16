@@ -65,6 +65,7 @@ public:
     struct ExprState {
       std::vector<ExprSlot> slots;
       BoundValueProgram* expression = nullptr;
+      std::vector<IndexReader::FieldSegments> fields;
       ValueResult cachedResult;
       segdoc cachedDoc;
       uint32_t cachedScoreBits = 0;
@@ -81,9 +82,11 @@ public:
     RuntimeClause(const SortClause& descriptor, IndexReader* reader)
       : descriptor(descriptor) {
       if (descriptor.getKind() == SortClause::COLUMN) {
-        comparator = descriptor.getSortField().createComparator(reader);
+        comparator = descriptor.getSortField().createComparator(*reader);
       } else if (descriptor.getKind() == SortClause::EXPR) {
         expr = std::make_unique<ExprState>();
+        expr->fields.resize(descriptor.getValueProgram().nodes.size());
+        descriptor.getValueProgram().resolveFields(*reader, expr->fields);
         expr->isDouble =
             descriptor.getValueProgram().root().type == ValueType::DOUBLE;
         expr->desc = descriptor.getOrder() == SortField::DESC;
@@ -253,7 +256,7 @@ public:
         for (RuntimeClause& clause : collector.clauses) {
           if (clause.descriptor.getKind() != SortClause::EXPR) continue;
           clause.expr->expression =
-              clause.descriptor.getValueProgram().bind(pool, segment);
+              clause.descriptor.getValueProgram().bind(pool, segment, clause.expr->fields);
           clause.resetCache();
         }
       } catch (...) {
@@ -282,7 +285,7 @@ public:
 
 public:
   FieldSortCollector(int64_t topCount, const std::vector<SortClause>& clauses,
-                     IndexReader* reader = nullptr, bool needsScores = true)
+                     IndexReader* reader, bool needsScores = true)
     : topCount(topCount), needsScores(needsScores),
       pq((size_t)std::max(topCount, (int64_t)0), FieldSortComparatorFunctor(this)) {
     assert(topCount >= 0);
@@ -315,7 +318,7 @@ public:
   // this segment (query cost capped by any filter cardinality). It is the
   // baseline candidate pruning must beat; negative means unknown, which
   // conservatively disables candidate activation.
-  void setSegment(int32_t segment, PostingsReader* reader,
+  void setSegment(const IndexReader::Segment& segment,
                   MemPool* pool = nullptr, int64_t sourceCost = -1) {
     segmentPool = pool;
     candidates = nullptr;
@@ -331,11 +334,11 @@ public:
     }
     segmentSourceCost = sourceCost;
     segmentWalkCard = 0;
-    segmentMaxDoc = reader != nullptr ? reader->maxDoc() : 0;
+    segmentMaxDoc = segment.maxDoc();
     for (auto& clause : clauses) {
       clause.resetCache();
       if (clause.comparator != nullptr) {
-        clause.comparator->setSegment(segment, reader);
+        clause.comparator->setSegment(segment);
       }
     }
     leafDescent = LeafDescent::UNDECIDED;

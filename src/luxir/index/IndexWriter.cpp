@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -28,6 +29,7 @@
 #include "SegmentMerger.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
+#include "luxir/search/OrdMap.h"
 #include "luxir/search/OrdMapStore.h"
 
 
@@ -2042,14 +2044,11 @@ void IndexWriter::sortMergeSources(std::vector<SegInfo*>& segs, const std::strin
   keyed.reserve(segs.size());
   for (SegInfo* seg : segs) {
     auto postingsReader = getSegmentPostingsReader(*seg);
-    FieldReader fields(*postingsReader);
     std::optional<int64_t> min;
-    if (fields.seek(indexSortField)) {
-      SegFieldInfo info;
-      fields.readFieldInfo(info);
-      if ((info.type == FieldType::INT || info.type == FieldType::DATE) &&
-          (info.flags & FieldType::COLUMN_STORED) != 0 && info.numValues > 0) {
-        min = IntColReader(*postingsReader, info).getMin();
+    if (const auto* info = postingsReader->fieldInfo(indexSortField)) {
+      if ((info->type == FieldType::INT || info->type == FieldType::DATE) &&
+          (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
+        min = IntColReader(*postingsReader, *info).getMin();
       }
     }
     keyed.push_back({seg, min});
@@ -3280,23 +3279,18 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
-  FieldReader fieldReader(reader);
-  if (!fieldReader.seek("id")) {
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
     return;
   }
 
-  SegFieldInfo idFieldInfo;
-  fieldReader.readFieldInfo(idFieldInfo);
-  TermsEnum termsEnum(pool, reader, idFieldInfo);
+  TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
   // Also get the "_version_" field for version comparison
-  FieldReader versionFieldReader(reader);
-  SegFieldInfo versionFieldInfo;
   std::optional<IntColReader> versionColReader;
-  if (versionFieldReader.seek("_version_")) {
-    versionFieldReader.readFieldInfo(versionFieldInfo);
-    versionColReader.emplace(reader, versionFieldInfo);
+  if (auto* versionFieldInfo = reader.fieldInfo("_version_")) {
+    versionColReader.emplace(reader, *versionFieldInfo);
     assert(!versionColReader->multiValued());
   }
 

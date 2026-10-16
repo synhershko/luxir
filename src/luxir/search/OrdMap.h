@@ -326,7 +326,7 @@ public:
   }
 
   /// Build an OrdMap for the given field across all segments in the reader.
-  static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
+  static std::shared_ptr<OrdMap> build(IndexReader::FieldSegments fields, IndexReader& reader);
 
   /// Build an OrdMap over `segs` in segment order; `maxDoc` is their total.
   /// IndexWriter uses this to persist maps for a commit before any reader

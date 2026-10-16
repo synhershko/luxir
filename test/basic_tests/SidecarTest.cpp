@@ -220,7 +220,7 @@ TEST_F(SidecarTest, persistedOrdMapsMatchAFreshBuild) {
   ASSERT_NE(nullptr, reader->ordMapStore());
   ASSERT_TRUE(reader->ordMapStore()->contains("color_s"));
   auto loaded = reader->getOrdMap("color_s");
-  auto built = OrdMap::build("color_s", *reader);
+  auto built = OrdMap::build(reader->field("color_s"), *reader);
   ASSERT_NE(nullptr, loaded);
   ASSERT_NE(nullptr, built);
   EXPECT_EQ(built->numOrds(), loaded->numOrds());

@@ -230,10 +230,11 @@ message Fusion {
   map<string, SearchOp> ops = 15;
 
   // Per-source weights keyed by source name, used by the fusion method.
-  // A source without an entry has weight 1. Weights must be finite and
-  // >= 0, every key must name a source, and at least one source must have a
-  // weight > 0. A zero weight disables its source: it is not executed and
-  // its documents do not enter the fused list, found, or the ops domain.
+  // A source without an entry has weight 1. Weights must be finite, >= 0,
+  // and within float range, every key must name a source, and at least one
+  // source must have a weight > 0. A zero weight disables its source: it is
+  // not executed and its documents do not enter the fused list, found, or the
+  // ops domain.
   map<string, double> weights = 16;
 }
 
@@ -1344,6 +1345,20 @@ message ScrubStats {
   uint64 last_pass_end = 5;   // Unix milliseconds; absent before the first pass
 }
 
+// Cached field metadata payload, excluding allocator overhead and unused
+// hash-table capacity.
+message FieldMetadataStats {
+  uint64 bytes = 1;
+  uint64 directories = 2;
+  uint64 directory_bytes = 3;
+  uint64 pages = 4;
+  uint64 page_bytes = 5;
+  uint64 entries = 6;
+  uint64 entry_bytes = 7;
+  uint64 names = 8;
+  uint64 name_bytes = 9;
+}
+
 // Node memory: Luxir's own budgets and usage, and the process allocator's
 // statistics where the allocator reports them.
 message MemoryStats {
@@ -1351,6 +1366,7 @@ message MemoryStats {
   StorageRamStats storage_ram = 2;
   // Present only when Luxir runs on jemalloc.
   JemallocStats jemalloc = 3;
+  FieldMetadataStats field_metadata = 4;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.

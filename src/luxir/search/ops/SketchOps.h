@@ -64,10 +64,9 @@ public:
   void forEachRawValue(int32_t segnum, DocSet* domain, F&& callback) {
     auto& postings = req.reader->segments()[(size_t)segnum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postings);
-    if (!fieldReader.seek(field)) return;
-    SegFieldInfo info;
-    fieldReader.readFieldInfo(info);
+    const SegFieldInfo* infoPtr = postings.fieldInfo(field);
+    if (infoPtr == nullptr) return;
+    const SegFieldInfo& info = *infoPtr;
     IntColReader column(postings, info);
     int64_t missing = 0;
     forEachIntColValue(domain, column, postings.maxDoc(), missing,
@@ -165,10 +164,9 @@ private:
   void accumulateTerms(HyperLogLog& sketch, int32_t segnum, DocSet* domain) {
     auto& postings = req.reader->segments()[(size_t)segnum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postings);
-    if (!fieldReader.seek(field)) return;
-    SegFieldInfo info;
-    fieldReader.readFieldInfo(info);
+    const SegFieldInfo* infoPtr = postings.fieldInfo(field);
+    if (infoPtr == nullptr) return;
+    const SegFieldInfo& info = *infoPtr;
     if (info.nTerms <= 0) return;
     // Mark the segment ordinals the domain touches, then hash each one's
     // term once: per-document cost is a bit set, not a hash.

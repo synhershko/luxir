@@ -6,6 +6,7 @@
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
+#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
@@ -383,13 +384,11 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   for (const auto& seg : segs) core->segOrds.emplace_back(seg.segInfo.seg_id, seg.ord);
   std::ranges::sort(core->segOrds);
 
-  // Check if we can share ordMaps from the previous reader
+  // Base-segment metadata is unchanged by deletes and overlays.
   if (previous && previous->coreGeneration == core->coreGeneration) {
-    IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", core->coreGeneration);
-    core->ordMaps = previous->ordMaps;
+    core->fields = previous->fields;
   } else {
-    IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", core->coreGeneration);
-    core->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
+    core->fields = std::make_shared<FieldRecords>();
   }
   // Persisted maps serve this core only if built for exactly its segments.
   for (const auto& aux : auxReadersList) {
@@ -416,27 +415,114 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
-std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view field) {
-  return core->ordMaps->getOrCreate(std::string(field), [this, field]() {
-    if (core->ordMapStore && core->ordMapStore->contains(field)) {
-      if (auto loaded = core->ordMapStore->load(field)) return loaded;
-    }
-    return OrdMap::build(field, *this);
-  });
-}
-
 std::vector<std::string> IndexReader::cachedOrdMapFields() const {
-  std::vector<std::string> fields;
-  core->ordMaps->dataMap.cvisit_all([&](const auto& entry) {
-    if (std::holds_alternative<std::shared_ptr<OrdMap>>(entry.second)) fields.push_back(entry.first);
+  std::vector<std::string> names;
+  core->fields->cvisit_all([&](const auto& entry) {
+    if (entry.second->ordMap.peek()) names.push_back(entry.first);
   });
-  std::ranges::sort(fields);
-  return fields;
+  std::ranges::sort(names);
+  return names;
 }
 
 const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);
   return it != segOrds.end() && it->first == segId ? &segs[(size_t)it->second] : nullptr;
+}
+
+IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t numSegments,
+                                      size_t first, int32_t ordinal)
+    : name(name), numSegments(numSegments),
+      ordinals(std::make_unique<std::atomic<int32_t>[]>(numSegments)) {
+  for (size_t i = 0; i < numSegments; i++) {
+    ordinals[i].store(i < first ? -1 : UNRESOLVED, std::memory_order_relaxed);
+  }
+  ordinals[first].store(ordinal, std::memory_order_relaxed);
+  bytes = sizeof(FieldRecord) + numSegments * sizeof(std::atomic<int32_t>)
+      + sizeof(FieldRecords::value_type)
+      + (name.size() > std::string().capacity() ? 2 * (name.size() + 1) : 0);
+  fieldMetadataMemory.names.fetch_add(1, std::memory_order_relaxed);
+  fieldMetadataMemory.nameBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+IndexReader::FieldRecord::~FieldRecord() {
+  auto* stats = fieldStats.load(std::memory_order_relaxed);
+  fieldMetadataMemory.names.fetch_sub(1, std::memory_order_relaxed);
+  fieldMetadataMemory.nameBytes.fetch_sub(bytes + (stats ? sizeof(*stats) : 0), std::memory_order_relaxed);
+  delete stats;
+}
+
+IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
+  const FieldRecord* record = nullptr;
+  auto get = [&](const auto& item) { record = item.second.get(); };
+  if (!core->fields->cvisit(name, get)) {
+    for (size_t i = 0; i < core->segs.size(); i++) {
+      int32_t ordinal = core->segs[i].postingsReader().findOrdinal(name);
+      if (ordinal < 0) continue;
+      auto fresh = std::make_unique<FieldRecord>(name, core->segs.size(), i, ordinal);
+      core->fields->try_emplace(std::string(name), std::move(fresh));
+      core->fields->cvisit(name, get);
+      break;
+    }
+  }
+  return record ? FieldSegments(record, core->segs.data()) : FieldSegments{};
+}
+
+std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {
+  auto fields = field(name);
+  if (!fields.exists()) return {};
+  return fields.record->ordMap.getOrCreate([&]() -> std::shared_ptr<OrdMap> {
+    if (core->ordMapStore && core->ordMapStore->contains(name)) {
+      if (auto loaded = core->ordMapStore->load(name)) return loaded;
+    }
+    return OrdMap::build(fields, *this);
+  });
+}
+
+std::string_view IndexReader::FieldSegments::name() const noexcept {
+  return record ? std::string_view(record->name) : std::string_view{};
+}
+
+const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
+  if (!record) return nullptr;
+  assert(segment < record->numSegments);
+  auto& postings = segments[segment].postingsReader();
+  int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
+  if (ordinal == FieldRecord::UNRESOLVED) {
+    ordinal = postings.findOrdinal(record->name);
+    record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
+  }
+  return postings.fieldInfo(ordinal);
+}
+
+bool IndexReader::FieldSegments::exists() const noexcept {
+  return record != nullptr;
+}
+
+size_t IndexReader::FieldSegments::size() const noexcept {
+  return record ? record->numSegments : 0;
+}
+
+const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
+  assert(record);
+  auto* stats = record->fieldStats.load(std::memory_order_acquire);
+  if (!stats) {
+    auto fresh = std::make_unique<Similarity::FieldStats>();
+    for (size_t i = 0; i < size(); i++) {
+      fresh->maxDoc += segments[i].maxDoc();
+      if (auto* info = at(i)) {
+        fresh->docsWithField += info->docsWithField;
+        fresh->sumDocFreq += info->sumDocFreq;
+        fresh->sumTotalTermFreq += info->sumTotalTermFreq;
+      }
+    }
+    if (record->fieldStats.compare_exchange_strong(stats, fresh.get(),
+                                                 std::memory_order_release,
+                                                 std::memory_order_acquire)) {
+      stats = fresh.release();
+      fieldMetadataMemory.nameBytes.fetch_add(sizeof(*stats), std::memory_order_relaxed);
+    }
+  }
+  return *stats;
 }
 
 std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {

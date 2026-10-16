@@ -4,8 +4,9 @@
 #pragma once
 
 #include "luxir/codec/StreamVByte.h"
-#include "FieldReader.h"
+#include "PostingsReader.h"
 #include "Postings.h"
+#include "SkipStats.h"
 #include "TrieReader.h"
 
 #include <algorithm>
@@ -893,6 +894,7 @@ public:
   // nTerms == 0 early returns need no such reset: sharedLen can only become
   // nonzero by advancing within a block, which an empty field never does.
   bool seek(std::string_view target) {
+    skipCount(SkipStats::termDictionarySeeks);
     if (fieldInfo.nTerms == 0) return false;
     seekBlock(target, 0);
     bool found = seekInBlock(target);

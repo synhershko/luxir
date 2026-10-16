@@ -515,6 +515,7 @@ public:
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       IndexReader& reader = ctx.reader;
+      auto segInfos = reader.field(query.getField());
       size_t numSegs = reader.segments().size();
       std::vector<std::vector<Hit>> perSegHits(numSegs);
 
@@ -556,15 +557,6 @@ public:
       // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
       std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
-      std::vector<SegFieldInfo> segInfoStorage(numSegs);
-      std::vector<SegFieldInfo*> segInfos(numSegs, nullptr);
-      for (size_t i = 0; i < numSegs; i++) {
-        FieldReader fieldReader(reader.segments()[i].postingsReader());
-        if (fieldReader.seek(query.getField())) {
-          fieldReader.readFieldInfo(segInfoStorage[i]);
-          segInfos[i] = &segInfoStorage[i];
-        }
-      }
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
@@ -582,10 +574,10 @@ public:
         && !query.getFieldType().normalizeOnWrite();
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
-        if (segInfos[i] != nullptr) {
+        if (segInfos.at(i) != nullptr) {
           // FIXED_SIZE vector column.  numVectors == #docs-with-field for
           // single-valued, or the total vector count for multi-valued.
-          VectorReader vr(reader.segments()[i].postingsReader(), *segInfos[i]);
+          VectorReader vr(reader.segments()[i].postingsReader(), *segInfos.at(i));
           segCount = vr.numVectors();
           if (segCount > 0) {
             if (vr.dims() != dims) {
@@ -674,7 +666,7 @@ public:
       bool approximateEngine = false;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
-        if (segCount <= 0 || segInfos[i] == nullptr) continue;
+        if (segCount <= 0 || segInfos.at(i) == nullptr) continue;
         IndexReader::Segment& seg = reader.segments()[i];
         DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
         // Domain contract (Query.h): a present domain is live-filtered and
@@ -722,7 +714,7 @@ public:
         } else {
           slots.push_back({
             .engine = std::make_unique<SegmentFlatColumnVectorEngine>(
-              (int32_t)i, seg, segInfos[i], v2dPerSeg[i], domain,
+              (int32_t)i, seg, segInfos.at(i), v2dPerSeg[i], domain,
               dims, metric, normalizeColumnOnCosineRescore),
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
@@ -974,7 +966,7 @@ public:
       if (!candidateScoresExact && !candidateHits.empty()) {
         rescoreAndCollapseCandidates(candidateHits,
                                      reader,
-                                     std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
+                                     segInfos,
                                      v2dSpan,
                                      std::span<const char>(segApproxInPool.data(), segApproxInPool.size()),
                                      queryPtr, dims, metric, normalizeColumnOnCosineRescore,
@@ -1336,7 +1328,7 @@ public:
     class SegmentFlatColumnVectorEngine final : public VectorEngine {
       int32_t segOrd;
       IndexReader::Segment& seg;
-      SegFieldInfo* segInfo;
+      const SegFieldInfo* segInfo;
       const SegV2D& v2d;
       DocSet* domain;
       int32_t dims;
@@ -1346,7 +1338,7 @@ public:
     public:
       SegmentFlatColumnVectorEngine(int32_t segOrd,
                                     IndexReader::Segment& seg,
-                                    SegFieldInfo* segInfo,
+                                    const SegFieldInfo* segInfo,
                                     const SegV2D& v2d,
                                     DocSet* domain,
                                     int32_t dims,
@@ -1941,27 +1933,23 @@ public:
             [limit = request.candidates]() { return new ScanAccumulator(limit); },
             [](ScanAccumulator* acc) { delete acc; });
           // Each search() round is a barrier: the host's deepen decision
-          // needs the whole merged pool.  TaskGroupRunner runs every unit
-          // inline when not spawning (serial requests take the same code
-          // path and produce the same result), and its destructor owns the
-          // unwind: if an inline unit throws, it cancels and drains the
-          // spawned tasks without double-throwing.
+          // needs the whole merged pool. The caller runs the final unit;
+          // TaskGroupRunner cancels and drains siblings if it throws.
           bool spawnTasks = parallel && units.size() > 1;
           if (spawnTasks) {
             parallelScanRoundsForTests.fetch_add(1, std::memory_order_relaxed);
           }
           TaskGroupRunner runner;
-          for (const auto& unit : units) {
-            runner.run(spawnTasks, [this, &unit, &request, &merger]() {
+          task_group_fanout(spawnTasks ? runner.group() : nullptr, units.size(),
+              [&](size_t i) {
+            return [this, unit = units[i], &request, &merger]() {
               VectorSearchResult part = scanUnit(unit, request);
-              // unique_ptr guards the obtained accumulator: a throw between
-              // obtain and release would otherwise orphan it (the merger
-              // only frees what is parked in its slot).
+              // Guard the accumulator until it is parked in the merger.
               std::unique_ptr<ScanAccumulator> acc(merger.obtain());
               foldPart(*acc, part);
               merger.release(acc.release());
-            });
-          }
+            };
+          });
           runner.join();
 
           ScanAccumulator* acc = merger.getData();
@@ -2220,7 +2208,7 @@ private:
   /// rescoreTaskGrainCandidates fold inline on the calling thread.
   static void rescoreAndCollapseCandidates(std::vector<VectorEngineHit>& candidates,
                                            IndexReader& reader,
-                                           std::span<SegFieldInfo* const> segInfos,
+                                           IndexReader::FieldSegments segInfos,
                                            std::span<const SegV2D> v2dPerSeg,
                                            std::span<const char> segApprox,
                                            const float* queryPtr,
@@ -2248,7 +2236,7 @@ private:
       if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
         throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
       }
-      SegFieldInfo* info = segInfos[(size_t)segOrd];
+      const SegFieldInfo* info = segInfos.at((size_t)segOrd);
       if (info == nullptr) {
         throw std::runtime_error("KnnQuery: vector candidate segment has no field info");
       }
@@ -2287,23 +2275,23 @@ private:
       merger.release(acc.release());
     };
 
-    // TaskGroupRunner owns the unwind path: if an inline (under-grain)
-    // bucket throws while spawned buckets are in flight, its destructor
-    // cancels and drains them instead of letting ~task_group double-throw.
-    TaskGroupRunner runner;
+    // Cancel and drain published buckets if a caller-side bucket throws.
     int64_t grain = std::max<int64_t>(1, rescoreTaskGrainCandidates);
+    std::vector<std::pair<size_t, size_t>> tasks, local;
     for (size_t b = 0; b < candidates.size();) {
-      int32_t segOrd = candidates[b].segOrd;
       size_t e = b + 1;
-      while (e < candidates.size() && candidates[e].segOrd == segOrd) e++;
-      // A bucket spawns only above the grain, and never when it is the whole
-      // pool (a single bucket gains nothing from a worker hand-off).
-      bool spawn = parallel
-        && (int64_t)(e - b) >= grain
-        && !(b == 0 && e == candidates.size());
-      runner.run(spawn, [&rescoreBucket, b, e]() { rescoreBucket(b, e); });
+      while (e < candidates.size() && candidates[e].segOrd == candidates[b].segOrd) e++;
+      if (!parallel) rescoreBucket(b, e);
+      else if ((int64_t)(e - b) >= grain || e == candidates.size()) tasks.emplace_back(b, e);
+      else local.emplace_back(b, e);
       b = e;
     }
+    TaskGroupRunner runner;
+    task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(), [&](size_t i) {
+      auto [b, e] = tasks[i];
+      return [&rescoreBucket, b, e]() { rescoreBucket(b, e); };
+    });
+    for (auto [b, e] : local) rescoreBucket(b, e);
     runner.join();
 
     RescoreAccumulator* acc = merger.getData();

@@ -365,8 +365,8 @@ public:
         bool disableRepeatDedup) const {
       // A segment written without positions (an older index_options) has no phrase matches.
       if (cachedFieldInfo == nullptr
-          || cachedFieldInfo->segInfos[segment.ord] == nullptr
-          || !FieldType::hasPositions(cachedFieldInfo->segInfos[segment.ord]->flags)) {
+          || cachedFieldInfo->segInfos.at(segment.ord) == nullptr
+          || !FieldType::hasPositions(cachedFieldInfo->segInfos.at(segment.ord)->flags)) {
         return {};
       }
       std::vector<const TermsEnum::PostingsState*> states;
@@ -476,7 +476,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         const EstimateMemo& estimate) {
       if (!estimate.nonempty) return nullptr;
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
+      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
       assert(segFieldInfo != nullptr);
 
       auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());

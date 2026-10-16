@@ -10,11 +10,12 @@
 #include <vector>
 
 #include "DocSet.h"
-#include "OrdMap.h"
+#include "Similarity.h"
+#include <boost/unordered/concurrent_flat_map.hpp>
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
-#include "luxir/util/SharedLazyMap.h"
+#include "luxir/util/SharedLazyCell.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define IREADER_DEBUG LOG_TRACE
@@ -153,8 +154,35 @@ public:
 
 /// IndexReader is thread safe
 class IndexReader {
+  struct FieldRecord;
+
 public:
   using Segment = ::luxir::Segment;
+
+  // A borrowed view, valid while its reader lives. Null means absent.
+  // at() lazily resolves ordinals and headers in this core's segments.
+  // stats() resolves every segment for header totals, including deleted docs.
+  class FieldSegments {
+    friend class IndexReader;
+    const FieldRecord* record = nullptr;
+    const Segment* segments = nullptr;
+    FieldSegments(const FieldRecord* record, const Segment* segments)
+        : record(record), segments(segments) {}
+
+  public:
+    FieldSegments() = default;
+    const PostingsReader::Field* at(size_t segment) const;
+    const PostingsReader::Field* at(const Segment& segment) const {
+      assert(!record || (segment.ord >= 0 && (size_t)segment.ord < size()
+                         && &segments[segment.ord] == &segment));
+      return at((size_t)segment.ord);
+    }
+    std::string_view name() const noexcept;
+    bool exists() const noexcept;
+    size_t size() const noexcept;
+    const Similarity::FieldStats& stats() const;
+    bool operator==(const FieldSegments&) const = default;
+  };
 
   struct ProjectableField {
     std::string_view name;
@@ -174,6 +202,24 @@ public:
 private:
   friend class ReaderManager;
 
+  // Positive names, header totals and OrdMaps shared by segment sets with the same
+  // core generation. The record owns its name and lazily caches each ordinal;
+  // it holds no Segment or reader, so views can use different open readers.
+  struct FieldRecord {
+    static constexpr int32_t UNRESOLVED = -2;
+    std::string name;
+    size_t numSegments;
+    std::unique_ptr<std::atomic<int32_t>[]> ordinals;
+    mutable std::atomic<Similarity::FieldStats*> fieldStats{nullptr};
+    mutable SharedLazyCell<OrdMap, true> ordMap;
+    size_t bytes;
+
+    FieldRecord(std::string_view name, size_t numSegments, size_t first, int32_t ordinal);
+    ~FieldRecord();
+  };
+  using FieldRecords = boost::unordered::concurrent_flat_map<
+      std::string, std::unique_ptr<FieldRecord>, PackedTermHash, PackedTermEqual>;
+
   // A physical snapshot is shared directly by readers with different schemas.
   // Its lazy catalogs and maps never retain a reader or schema.
   struct PhysicalCore {
@@ -181,7 +227,7 @@ private:
     std::once_flag projectableOnce;
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
-    std::shared_ptr<SharedLazyMap<std::string, OrdMap>> ordMaps;
+    std::shared_ptr<FieldRecords> fields;
     // Persisted maps built for exactly this segment set, or null.
     std::shared_ptr<OrdMapStore> ordMapStore;
     uint64_t coreGeneration = 0;
@@ -295,9 +341,11 @@ public:
     return core->coreGeneration;
   }
 
+  FieldSegments field(std::string_view name) const;
+
   // The field's global-ordinal map, loaded from the commit's persisted maps
   // when they cover it, else built; cached for the segment composition.
-  std::shared_ptr<OrdMap> getOrdMap(std::string_view field);
+  std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 
   // Fields whose OrdMap is cached for this composition (IndexWriter persists
   // the ones in use when a commit changes the segment set).
@@ -308,11 +356,6 @@ public:
 
   // This reader's segment `segId`, or null.
   const Segment* findSegment(uint64_t segId) const { return core->segment(segId); }
-
-  // Get the number of cached OrdMaps (for testing)
-  size_t getOrdMapCacheSize() const {
-    return core->ordMaps->dataMap.size();
-  }
 
   FilterCache* filterCache() const noexcept {
     return sharedFilterCache.get();

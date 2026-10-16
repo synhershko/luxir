@@ -54,6 +54,7 @@ namespace luxir {
 class OrdMapBuilder {
   std::string_view field;
   std::span<PostingsReader* const> segs;
+  IndexReader::FieldSegments fields;  // cached field headers, or empty
   OrdMap::DeltaEncoding deltaEncoding;
   TopTermsBuilder topTermsBuilder;
 
@@ -302,7 +303,7 @@ class OrdMapBuilder {
     std::optional<OrdColumnFormat::PredictedBlockInfo> singleFitPlan;
 
     TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader,
-                 SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
+                 const SegFieldInfo& finfo, OrdMap::DeltaEncoding encoding)
         : idx(idx), tenum(pool, postingsReader, finfo), encoding(encoding) {
       if (encoding == OrdMap::DeltaEncoding::PREDICTED) {
         deltas.emplace<PredictedDeltaBlocks>();
@@ -334,8 +335,11 @@ class OrdMapBuilder {
   };
 
 public:
-  OrdMapBuilder(std::string_view field, std::span<PostingsReader* const> segs, int64_t maxDoc)
-      : field(field), segs(segs),
+  // `fields` supplies cached per-segment headers when built through a reader;
+  // otherwise headers are read from each segment's postings.
+  OrdMapBuilder(std::string_view field, std::span<PostingsReader* const> segs, int64_t maxDoc,
+                IndexReader::FieldSegments fields = {})
+      : field(field), segs(segs), fields(fields),
         deltaEncoding(OrdMap::configuredDeltaEncoding()),
         topTermsBuilder(TopTermsBuilder::thresholdFor(maxDoc)) {}
 
@@ -351,6 +355,7 @@ public:
   int64_t numTerms = 0;
 
   void build() {
+    Signal::emit("ordMapBuild", this);
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
@@ -365,17 +370,16 @@ public:
     int segsWithValue = 0;
     for (auto i=0u; i<nsegs; i++) {
       auto& seg = *segs[i];
-      // Allocate FieldReader in pool so it has same lifetime as SegFieldInfo
-      auto* fieldReader = pool.make<FieldReader>(seg);
-      if (!fieldReader->seek(field)) {
-        // Field not found in this segment
+      const SegFieldInfo* fieldInfo;
+      if (fields.exists()) {
+        fieldInfo = fields.at(i);
+      } else {
+        fieldInfo = seg.fieldInfo(field);
+      }
+      if (fieldInfo == nullptr) {
         allTermsEnums.emplace_back(nullptr);
         continue;
       }
-      auto* fieldInfo = pool.make<SegFieldInfo>();  // Allocate in pool to avoid stack-use-after-scope
-      fieldReader->readFieldInfo(*fieldInfo);
-      //       TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& finfo) : idx(idx), tenum(pool, postingsReader, finfo), deltas(pool) {}
-
 
       allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(
           i, pool, seg, *fieldInfo, deltaEncoding));
@@ -642,16 +646,9 @@ OrdMap::DeltaEncoding OrdMap::configuredDeltaEncoding() {
 }
 
 
-std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reader) {
-  std::vector<PostingsReader*> segs;
-  segs.reserve(reader.segments().size());
-  for (auto& seg : reader.segments()) segs.push_back(&seg.postingsReader());
-  return build(field, segs, reader.maxDoc());
-}
-
-std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, std::span<PostingsReader* const> segs,
-                                      int64_t maxDoc) {
-  OrdMapBuilder builder(field, segs, maxDoc);
+static std::shared_ptr<OrdMap> buildOrdMap(IndexReader::FieldSegments fields, std::string_view field,
+                                           std::span<PostingsReader* const> segs, int64_t maxDoc) {
+  OrdMapBuilder builder(field, segs, maxDoc, fields);
   builder.build();
   
   // Handle single segment with values case
@@ -667,6 +664,18 @@ std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, std::span<Postings
   return std::make_shared<OrdMap>(
       std::move(builder.data), builder.start, builder.size,
       std::move(builder.topTerms));
+}
+
+std::shared_ptr<OrdMap> OrdMap::build(IndexReader::FieldSegments fields, IndexReader& reader) {
+  std::vector<PostingsReader*> segs;
+  segs.reserve(reader.segments().size());
+  for (auto& seg : reader.segments()) segs.push_back(&seg.postingsReader());
+  return buildOrdMap(fields, fields.name(), segs, reader.maxDoc());
+}
+
+std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, std::span<PostingsReader* const> segs,
+                                      int64_t maxDoc) {
+  return buildOrdMap({}, field, segs, maxDoc);
 }
 
 
