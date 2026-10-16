@@ -132,7 +132,7 @@ void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
   size_t chunkVecs = chunkBytes == 0 ? (size_t)numVals
                                      : std::max((size_t)1, chunkBytes / bytesPerVec);
   size_t chunkFloats = chunkVecs * (size_t)dims;
-  bool f32 = vr.encoding() == VectorEncoding::F32;
+  bool f32 = vr.encoding() == VectorEncoding::F32 && !vr.hasNorms();
   const float* base = f32 ? (const float*)vr.rowAtRank(0).data() : nullptr;
   if ((normalizeForFaiss || !f32) && scratch.size() < chunkFloats) scratch.resize(chunkFloats);
   if (rotation != nullptr && rotated.size() < chunkFloats) rotated.resize(chunkFloats);
