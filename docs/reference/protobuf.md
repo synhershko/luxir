@@ -840,6 +840,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.index_options"></a>[`index_options`](#field-luxir.fielddef.index_options) | 17 | [`FieldDef.IndexOptions`](#enum-luxir.fielddef.indexoptions) | optional | absent: inherit from parent, else positions |
 | <a id="field-luxir.fielddef.norms"></a>[`norms`](#field-luxir.fielddef.norms) | 18 | `bool` | optional | TEXT only: keep per-document length norms for BM25. false scores every document as if it had the average field length. Requires FREQS or POSITIONS. Absent: inherit from parent, else true (false at DOCS). |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. dims stays the input dimension; the column, ANN overlays and kNN scoring use truncate\_dims. COSINE fields renormalize the prefix (normalized=true is rejected); L2 and IP keep it as-is. Must be positive and &lt; dims when dims is set. Unset inherits, falling back to 0 (no truncation). |
+| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 20 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to F32. F16 and INT8 reject non-finite elements; F16 also rejects magnitudes above 65504. Applies to newly written segments. |
+| <a id="field-luxir.fielddef.keep_original"></a>[`keep_original`](#field-luxir.fielddef.keep_original) | 21 | `bool` | optional | VECTOR only. Also keep the submitted float32 vectors in a separate cold column that searches never read, so the field can be re-encoded later. Unset inherits, falling back to false. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1983,6 +1985,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SortSpec.SortMode`](#enum-luxir.sortspec.sortmode)
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
+- [`VectorEncoding`](#enum-luxir.vectorencoding)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
 <a id="enum-luxir.calendargap.unit"></a>
@@ -2245,6 +2248,20 @@ Which value of a multi-valued field keys the sort. Unset picks min for ascending
 | <a id="value-luxir.updateresponse.status.ok"></a>[`OK`](#value-luxir.updateresponse.status.ok) | 1 | the update was successful |
 | <a id="value-luxir.updateresponse.status.partial"></a>[`PARTIAL`](#value-luxir.updateresponse.status.partial) | 2 | part of the request took effect, part failed (see errors) |
 | <a id="value-luxir.updateresponse.status.error"></a>[`ERROR`](#value-luxir.updateresponse.status.error) | 3 | The request failed. If error is unset, the failure was per-document (see errors) and the request had no visible effect on the index. If error is set, the failure was request-level (e.g. commit pipeline) and the effect of individual documents is indeterminate beyond what errors lists. |
+
+<a id="enum-luxir.vectorencoding"></a>
+
+### luxir.VectorEncoding
+
+Storage encoding of a vector field's column. Exact search and the rescoring of ANN candidates score against the stored encoding.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.vectorencoding.f32"></a>[`F32`](#value-luxir.vectorencoding.f32) | 0 | float32 per element (4 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.f16"></a>[`F16`](#value-luxir.vectorencoding.f16) | 1 | IEEE half precision per element (2 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.int8"></a>[`INT8`](#value-luxir.vectorencoding.int8) | 2 | Per-vector scalar quantization: a float offset and scale per vector plus one uint8 code per dimension (8 + dims bytes). |
 
 <a id="enum-luxir.vectormetric"></a>
 
