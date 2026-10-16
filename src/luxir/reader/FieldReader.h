@@ -112,6 +112,8 @@ struct SegFieldInfo {
   // VECTOR only: the column's VectorEncoding, as written for this segment.
   // Serialized only for VECTOR fields.
   int32_t vectorEncoding = 0;
+  // VECTOR only: rows carry the |x|^2 prefix (see VectorCodec.h).
+  bool vectorNorms = false;
 
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is
@@ -261,7 +263,12 @@ public:
       fieldInfo.mono2MetaOff = fieldIS.readVlong();
       fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
       fieldInfo.valDocMetaOff = fieldIS.readVlong();
-      fieldInfo.vectorEncoding = fieldInfo.type == FieldType::VECTOR ? fieldIS.readVint() : 0;
+      fieldInfo.vectorEncoding = 0;
+      fieldInfo.vectorNorms = false;
+      if (fieldInfo.type == FieldType::VECTOR) {
+        fieldInfo.vectorEncoding = fieldIS.readVint();
+        fieldInfo.vectorNorms = fieldIS.readVint() != 0;
+      }
     }
   }
 
