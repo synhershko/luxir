@@ -28,9 +28,10 @@
 //   backward), matching protobuf's map semantics on the binary wire.
 // - Vector is a bare number array (null when no encoding is set).
 // - Match reads accept sugar: {"<field>": <value>} - a single unknown key acts as
-//   field+val and composes with operator/min_match; combining it with an explicit
-//   "field"/"val" (or a second unknown key) is an error. A schema field literally
-//   named like a canonical key needs the canonical form. Writes are always canonical.
+//   field+val and composes with the option keys (operator, min_match, fuzziness and
+//   its options); combining it with an explicit "field"/"val" (or a second unknown
+//   key) is an error. A schema field literally named like a canonical key needs the
+//   canonical form. Writes are always canonical.
 // - Query reads accept a bare STRING anywhere a query object goes: it is sugar for
 //   the expr arm ({"query": "status:active AND year:>=1960"}), which also gives
 //   Filter string sugar. Filter objects without except_ops are structured queries;
@@ -275,6 +276,16 @@ struct from<JSON, luxir::api::Match> {
             util::from_json<O>(value.operator_, ctx, vit, vend);
           } else if (key == "min_match") {
             util::from_json<O>(value.min_match, ctx, vit, vend);
+          } else if (key == "fuzziness") {
+            util::from_json<O>(value.fuzziness, ctx, vit, vend);
+          } else if (key == "prefix_length") {
+            util::from_json<O>(value.prefix_length, ctx, vit, vend);
+          } else if (key == "max_expansions") {
+            util::from_json<O>(value.max_expansions, ctx, vit, vend);
+          } else if (key == "transpositions") {
+            util::from_json<O>(value.transpositions, ctx, vit, vend);
+          } else if (key == "fuzzy_rewrite") {
+            util::from_json<O>(value.fuzzy_rewrite, ctx, vit, vend);
           } else {
             // Sugar: one unknown key acts as field+val. Transfer its arena
             // storage so the next option key cannot overwrite the field name.

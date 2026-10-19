@@ -384,6 +384,22 @@ message Match {
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
+  // Fuzzy matching: when set, each analyzed term (the single term of a string
+  // or id field) matches like a FuzzyQuery on that term, with
+  // FuzzyQuery.fuzziness syntax ("AUTO", "AUTO:3,6", "0", "1", "2").
+  // operator and min_match combine the fuzzy terms as usual. Numeric and date
+  // fields reject it.
+  optional string fuzziness = 5;
+
+  // FuzzyQuery.prefix_length for each term. Only with fuzziness.
+  optional int32 prefix_length = 6;
+  // FuzzyQuery.max_expansions for each term. Only with fuzziness.
+  optional int32 max_expansions = 7;
+  // FuzzyQuery.transpositions for each term. Only with fuzziness.
+  optional bool transpositions = 8;
+  // FuzzyQuery.rewrite for each term. Only with fuzziness.
+  optional FuzzyRewrite fuzzy_rewrite = 9;
+
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
@@ -519,17 +535,56 @@ message FuzzyQuery {
   string field = 1;
   string term = 2;
 
-  // Maximum edit distance, 0..2. Unset = AUTO by term length:
-  // 0 for <=2 bytes, 1 for <=5, else 2.
+  // Maximum edit distance, 0..2, counted in code points. Unset = AUTO by
+  // term length: 0 for <=2 code points, 1 for <=5, else 2.
   optional int32 max_edits = 3;
 
-  // Leading bytes that must match exactly. Unset = 1; 0 = no required prefix.
+  // Leading code points that must match exactly. Unset = 1; 0 = no required
+  // prefix.
   optional int32 prefix_length = 4;
 
   // Max term expansions, closest terms first. Unset/0 = default 50. A
-  // positive value requests that cap; the operator/clause budget may lower it
-  // with a warning. Negative values are rejected.
+  // positive value requests that cap; the operator/clause budget may lower it.
+  // Negative values are rejected. Ignored by the CONSTANT_SCORE rewrite.
   int32 max_expansions = 5;
+
+  // Count an adjacent transposition ("ab" <-> "ba") as one edit (Damerau /
+  // optimal string alignment). Unset = true.
+  optional bool transpositions = 6;
+
+  // Elasticsearch-style fuzziness, instead of max_edits: "AUTO" (= AUTO:3,6),
+  // "AUTO:low,high" (0 edits below low code points, 1 below high, else 2), or
+  // "0", "1", "2". AUTO is case-insensitive. Setting both is an error.
+  optional string fuzziness = 7;
+
+  // How expanded terms become the query; see FuzzyRewrite.
+  FuzzyRewrite rewrite = 8;
+
+  // Top-terms rewrites: keep at most this many closest terms (Lucene
+  // top_terms_N). Unset/0 = max_expansions decides. Negative is rejected.
+  int32 rewrite_size = 9;
+}
+
+// How a fuzzy query turns its expanded terms into the query that runs. Edit
+// distance is counted in code points; terms are kept closest first. Whenever
+// a cap the request did not leave to the default 50 drops terms (an explicit
+// max_expansions or rewrite_size, the 64-term scoring clause budget, or the
+// operator expansion limit), the response carries a fuzzy_truncated warning.
+enum FuzzyRewrite {
+  // Disjunction of the closest terms, scored with one blended (max) document
+  // frequency so a rare misspelling does not outscore the common spelling;
+  // each term's score is scaled by its similarity.
+  TOP_TERMS_BLENDED_FREQS = 0;
+  // Disjunction of the closest terms, each scored with its own statistics
+  // and scaled by its similarity.
+  TOP_TERMS = 1;
+  // Disjunction of the closest terms, each contributing a constant of boost
+  // times its similarity.
+  TOP_TERMS_BOOST = 2;
+  // Every term within the distance, as one constant-score union: no closest-N
+  // selection and no clause budget (the operator expansion limit still
+  // applies).
+  CONSTANT_SCORE = 3;
 }
 
 message PhraseQuery {

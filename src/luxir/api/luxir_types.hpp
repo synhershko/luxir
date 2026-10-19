@@ -111,6 +111,7 @@ enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
+enum class FuzzyRewrite { TOP_TERMS_BLENDED_FREQS = 0, TOP_TERMS = 1, TOP_TERMS_BOOST = 2, CONSTANT_SCORE = 3 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
@@ -144,9 +145,13 @@ struct RegexQuery { std::string_view field; std::string_view pattern; };
 struct FuzzyQuery {
   std::string_view field;
   std::string_view term;
+  std::optional<std::string_view> fuzziness;
   std::optional<std::int32_t> max_edits;
   std::optional<std::int32_t> prefix_length;
   int32_t max_expansions = 0;
+  FuzzyRewrite rewrite = FuzzyRewrite::TOP_TERMS_BLENDED_FREQS;
+  int32_t rewrite_size = 0;
+  std::optional<bool> transpositions;
 };
 struct PhraseQuery {
   std::string_view field;
@@ -747,8 +752,13 @@ struct Match {
   using Operator = luxir::api::Match_::Operator;
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> val;
+  std::optional<std::string_view> fuzziness;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
+  std::optional<std::int32_t> prefix_length;
+  std::optional<std::int32_t> max_expansions;
+  std::optional<FuzzyRewrite> fuzzy_rewrite;
+  std::optional<bool> transpositions;
 };
 struct AnyOfQuery {
   std::string_view field;

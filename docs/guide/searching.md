@@ -585,7 +585,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | Phrase | `{"phrase":{"field":"title_t","text":"way of kings","slop":0}}` | Position-aware; see the [query language](query-language.md#terms-and-phrases) for slop semantics. |
 | Range | `{"range":{"field":"year_i","gte":1960,"lt":1970}}` | Numeric, date, string, ID, or text term ranges. |
 | Prefix | `{"prefix":{"field":"title_t","prefix":"king"}}` | Term prefix, not a general wildcard. |
-| Fuzzy | `{"fuzzy":{"field":"author_s","term":"Sandersen","max_edits":1}}` | Closest-term rewrite; `max_expansions` defaults to `50`. |
+| Fuzzy | `{"fuzzy":{"field":"author_s","term":"Sandersen","fuzziness":"AUTO"}}` | Closest-term rewrite in code points with transpositions; `max_expansions` defaults to `50`. |
 | Boolean | `{"boolean":{"required":[...],"filter":[...],"optional":[...],"prohibited":[...],"min_match":1}}` | Uniform composition of scoring and non-scoring clauses. |
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
@@ -1072,9 +1072,11 @@ supported maximum:
 }
 ```
 
-Treat warning `code` as the machine key and `message` as human detail. The
-fuzzy query expansion limits are execution policy and do not produce response
-warnings.
+Treat warning `code` as the machine key and `message` as human detail. A
+fuzzy query whose expansions a cap drops (an explicit `max_expansions` or
+`rewrite_size`, the 64-term scoring clause budget, or the operator limit)
+warns with `fuzzy_truncated`; the default `max_expansions` of 50 truncates
+silently, as in Lucene.
 
 See [HTTP API conventions](http-api.md#errors) for error responses and how to
 handle a search that fails after streaming has begun.
