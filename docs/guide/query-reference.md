@@ -467,6 +467,63 @@ in their own guides:
 - [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
   inclusive boundaries, dateline crossing, and distance units.
 
+## Named queries
+
+Any query object can carry a `_name` (`name` in the canonical request and
+over gRPC: `Query.name`). Set `get_matched_queries` on the result list
+(`top_docs` or `fusion`) and each returned document gets a
+`_matched_queries_` field listing the named clauses it matches, in request
+order, the same feature as Elasticsearch's named queries:
+
+```http
+POST /collections/books/_search
+
+{
+  "query": {
+    "boolean": {
+      "required": [{"match": {"title_t": "dune"}, "_name": "title"}],
+      "optional": [{"match": {"author_s": "Frank Herbert"}, "_name": "author"}]
+    }
+  },
+  "filter": [{"range": {"field": "year_i", "gte": 1960}, "_name": "modern"}],
+  "fields": ["id"],
+  "get_matched_queries": true
+}
+```
+
+```json
+{
+  "docs": [
+    {"id": "b1", "_matched_queries_": ["title", "author", "modern"]},
+    {"id": "b2", "_matched_queries_": ["title", "modern"]}
+  ]
+}
+```
+
+- A name may sit on any clause at any depth, including filters, wrapper
+  arms and the root query. Names in facet or domain queries are not reported.
+- A named clause is evaluated by itself, for the returned documents only:
+  a document lists every named clause it satisfies, whether or not that
+  clause decided the match (a named `prohibited` clause therefore never
+  appears). A named `knn` clause selects its own nearest neighbors among all
+  live documents, not within its enclosing filters.
+- Two clauses with the same name merge: the name is listed once when either
+  matches. Identical clauses under different names are both reported, even
+  though the engine executes them once.
+- `include_named_queries_score: true` turns the field into a map from name
+  to that clause's own score (the score it would get as the whole query,
+  before any enclosing boost; for a merged name, the highest). A `_name`
+  beside a numeric `boost` sugar names the boosted clause.
+- A document matching no named clause omits the field. Naming a clause does
+  not change matching or scoring.
+- Under `fusion`, the names come from every source's query and filters plus
+  the fusion filters; a fused document lists the names it matches in any
+  source. Per-source `get_matched_queries` is ignored.
+
+In `columns` format a names-only `_matched_queries_` is a column of string
+lists (empty for a document without matches). The score map has no column
+form and is always placed in the row documents.
+
 ## Limits
 
 - `knn`, `geo_box`, and `geo_distance` are structured-only: expression

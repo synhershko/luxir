@@ -500,8 +500,15 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // passes through here, so the shared budget bounds tree depth no matter
   // which parser (wire, JSON, expr, simple_query) produced the tree.
   NestingScope nesting(context);
+  // Reserve the entry before descending, so names list in document order.
+  size_t namedSlot = 0;
+  bool named = !pquery.name.empty() && context.named != nullptr;
+  if (named) {
+    namedSlot = context.named->size();
+    context.named->emplace_back(pquery.name, nullptr);
+  }
   // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
-  return std::visit(luxir::overloaded{
+  luxir::Query* query = std::visit(luxir::overloaded{
     [&](const luxir::api::Match& m) -> luxir::Query* { return parseMatch(m); },
     [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseAnyOf(a); },
     [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parsePhrase(p); },
@@ -528,6 +535,8 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);
+  if (named) (*context.named)[namedSlot].second = query;
+  return query;
 }
 
 } // luxir

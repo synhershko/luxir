@@ -165,6 +165,14 @@ message TopDocs {
   optional float min_score = 14;
 
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
+
+  // Return, for each document, the pseudo-field _matched_queries_ listing the
+  // names (Query.name) of the named clauses in query and filter that the
+  // document matches. Documents matching none omit the field.
+  bool get_matched_queries = 16;
+  // With get_matched_queries, return _matched_queries_ as a map of name to
+  // that clause's own score instead of a list of names.
+  bool include_named_queries_score = 17;
 }
 
 // Hybrid-search fusion: run several source queries (each a full TopDocs spec)
@@ -225,6 +233,12 @@ message Fusion {
   // not executed and its documents do not enter the fused list, found, or the
   // ops domain.
   map<string, double> weights = 16;
+
+  // As TopDocs.get_matched_queries, over the named clauses of every source
+  // (and fusion filters): a fused document lists the names it matches in any
+  // source. Per-source get_matched_queries is ignored.
+  bool get_matched_queries = 18;
+  bool include_named_queries_score = 19; // as TopDocs.include_named_queries_score
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
@@ -288,6 +302,12 @@ message Query {
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
   }
+
+  // Optional clause name. A request with get_matched_queries reports, for each
+  // returned document, the names of the named clauses it matches (anywhere in
+  // the tree, filters included). Reusing a name merges the clauses: the name
+  // matches when any of them does. Naming does not change matching or scoring.
+  string name = 21;
 }
 
 message ExistsQuery {

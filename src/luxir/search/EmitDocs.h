@@ -39,6 +39,7 @@
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/NamedQueries.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
@@ -764,6 +765,10 @@ public:
   bool parallel;
   size_t colCap;  // dense response columns map capacity (column-placed fields + _score_)
   size_t rowCap;  // scratch columns map capacity (row-placed fields)
+  // get_matched_queries: the _matched_queries_ pseudo-field. Names only are
+  // an ArrArrStr column under columns format; scores (a name -> score Map)
+  // and rows format go into the per-document maps.
+  NamedQueries* namedQueries;
   int64_t batchStart;  // absolute rank cursor, clamped to numCollected
   bool fieldMetadataResolved = false;
 
@@ -771,12 +776,13 @@ public:
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool getNumber, bool getScores,
-                 bool scoresInRows, bool parallel, size_t colCap, size_t rowCap, DocBatchMetadata metadata)
+                 bool scoresInRows, bool parallel, size_t colCap, size_t rowCap, DocBatchMetadata metadata,
+                 NamedQueries* namedQueries)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
         getScores(getScores), scoresInRows(scoresInRows),
-        parallel(parallel), colCap(colCap), rowCap(rowCap),
+        parallel(parallel), colCap(colCap), rowCap(rowCap), namedQueries(namedQueries),
         batchStart(std::min(offset, numCollected)) {}
 
   void produce() override;
@@ -1094,17 +1100,57 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
 
+    // Named clauses matched by each row, sorted by row then name.
+    std::vector<NamedQueries::Hit> namedHits;
+    if (namedQueries != nullptr && columnSize > 0) {
+      namedHits = namedQueries->evaluate(req, segDocs, runs);
+    }
+    bool namedRows = namedQueries != nullptr && (scoresInRows || namedQueries->scores);
+    auto rowHits = [&](RowIndex row) {
+      auto first = std::ranges::lower_bound(namedHits, row, {}, &NamedQueries::Hit::row);
+      auto last = std::ranges::upper_bound(namedHits, row, {}, &NamedQueries::Hit::row);
+      return std::span<const NamedQueries::Hit>(first, last);
+    };
+    auto names = [&](std::span<const NamedQueries::Hit> hits) {
+      luxir::api::ArrStr out;
+      auto* values = build::allocArray(out.v, hits.size(), mr);
+      for (size_t j = 0; j < hits.size(); j++) values[j] = namedQueries->names[hits[j].name];
+      return out;
+    };
+    if (namedQueries != nullptr && !namedRows && columnSize > 0) {
+      auto& column = build::columnSlot(docListProto.columns, colCap, "_matched_queries_", mr);
+      auto* lists = build::allocArray(
+          column.kind.template emplace<luxir::api::ArrArrStr>().v, (size_t)columnSize, mr);
+      for (int i = 0; i < columnSize; i++) lists[i] = names(rowHits((RowIndex)i));
+    }
+
     // Scores bypass the scratch column: every doc has one, and a direct
     // write avoids the all-present column's sentinel ambiguity (a real
     // 0.0 score would collide with ColFloat's default missing_val).
     bool scoreRows = returnScores && scoresInRows;
-    if ((scratchColumns.size() > 0 || scoreRows) && columnSize > 0) {
-      size_t fieldCap = scratchColumns.size() + (scoreRows ? 1 : 0);
+    if ((scratchColumns.size() > 0 || scoreRows || namedRows) && columnSize > 0) {
+      size_t fieldCap = scratchColumns.size() + (scoreRows ? 1 : 0) + (namedRows ? 1 : 0);
       auto* rows = scatterColumnsToRows(scratchColumns, docListProto, (size_t)columnSize, fieldCap, mr);
       if (scoreRows) {
         for (int i = 0; i < columnSize; i++) {
           build::mapSlot<luxir::api::Val>(rows[i].fields, fieldCap, "_score_", mr)->kind =
               getScore(batchStart + i);
+        }
+      }
+      // A row matching no named clause omits the field.
+      for (int i = 0; namedRows && i < columnSize; i++) {
+        auto hits = rowHits((RowIndex)i);
+        if (hits.empty()) continue;
+        auto* value = build::mapSlot<luxir::api::Val>(
+            rows[i].fields, fieldCap, "_matched_queries_", mr);
+        if (!namedQueries->scores) {
+          value->kind = names(hits);
+          continue;
+        }
+        auto& map = value->kind.template emplace<luxir::api::Map>();
+        for (const auto& hit : hits) {
+          build::mapSlot<luxir::api::Val>(map.fields, hits.size(),
+              namedQueries->names[hit.name], mr)->kind = hit.score;
         }
       }
     }
@@ -1264,7 +1310,8 @@ void emitDocsResponse(SearchRequest& req,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
-                      DocBatchMetadata metadata = {})
+                      DocBatchMetadata metadata = {},
+                      NamedQueries* namedQueries = nullptr)
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1304,8 +1351,9 @@ void emitDocsResponse(SearchRequest& req,
   // _score_; the scratch map holds the row-placed fields (_score_ bypasses
   // scratch and is written per row directly).  Split so ["id", "*"] over a
   // large dynamic-field catalog does not reserve a catalog-sized array for
-  // the one-entry dense map, and vice versa.
-  size_t colCap = 1, rowCap = 0;
+  // the one-entry dense map, and vice versa. A names-only _matched_queries_
+  // column takes one more dense slot.
+  size_t colCap = namedQueries != nullptr ? 2 : 1, rowCap = 0;
   for (const auto& rf : rfields) {
     if (rf.fieldType == nullptr) continue;  // _score_ pseudo-field
     (rf.rows ? rowCap : colCap)++;
@@ -1317,7 +1365,7 @@ void emitDocsResponse(SearchRequest& req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, getNumber, getScores, scoresInRows,
-      /*parallel=*/req.tg != nullptr, colCap, rowCap, std::move(metadata));
+      /*parallel=*/req.tg != nullptr, colCap, rowCap, std::move(metadata), namedQueries);
   req.streamStarted();
   emitter->produce();
 }

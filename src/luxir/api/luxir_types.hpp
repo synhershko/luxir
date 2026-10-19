@@ -577,6 +577,8 @@ struct TopDocs {                                                 // all indirect
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
+  bool get_matched_queries = false;
+  bool include_named_queries_score = false;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
@@ -592,6 +594,8 @@ struct Fusion {                                                  // needs TopDoc
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
+  bool get_matched_queries = false;
+  bool include_named_queries_score = false;
 };
 struct Domain {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -806,6 +810,7 @@ struct Query {                                                 // needs Match,An
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
                AnyOfQuery>
       kind;
+  std::string_view name;
 };
 struct UpdateRequest {                                         // needs CommitParams
   std::string_view request_id;

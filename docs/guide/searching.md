@@ -98,6 +98,8 @@ one.
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
+| `get_matched_queries` | Add `_matched_queries_`, the names of the `_name`d clauses each document matches; see [Named queries](query-reference.md#named-queries). |
+| `include_named_queries_score` | With `get_matched_queries`, make `_matched_queries_` a map from name to that clause's score. |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
@@ -799,6 +801,10 @@ named and matched by a pattern is
 returned once, in its explicit placement, so `"fields": ["id", "*"]` returns
 an `id` column beside rows of everything else. `_score_` is requested
 explicitly (`get_scores`) and keeps the format's placement.
+`_matched_queries_` ([named queries](query-reference.md#named-queries)) is
+requested with `get_matched_queries`: a list of clause names, kept in the
+format's placement, or with `include_named_queries_score` a name-to-score
+map, always in the row documents.
 
 With [field variants](schema.md#field-variants): bare names return the
 primary's stored source or its own column, independently of the search and
