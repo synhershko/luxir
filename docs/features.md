@@ -208,7 +208,8 @@ clauses, as non-scoring filters, as facet domains, and as fusion sources.
 Anywhere a query goes, it can be a structured object or an expression string.
 
 - `match` (analyzed, AND/OR operator, minimum-match; numeric and date
-  equality through columns), `phrase` (positional, with slop), `boolean`
+  equality through columns), `phrase` (positional, with slop),
+  `match_phrase_prefix` (a phrase whose last word is a prefix), `boolean`
   (required, optional, prohibited, and filter clauses with minimum-match),
   `any_of` (exact value-set membership), `exists`, and match-all.
 - `range` over numeric, date, string, ID, and text fields, either side open.

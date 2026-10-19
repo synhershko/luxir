@@ -129,6 +129,7 @@ defaults and constraints are described in the comments and guides.
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
+- [`MatchPhrasePrefixQuery`](#message-luxir.matchphraseprefixquery)
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
@@ -1213,6 +1214,21 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
 
+<a id="message-luxir.matchphraseprefixquery"></a>
+
+### luxir.MatchPhrasePrefixQuery
+
+A phrase whose last analyzed word is a prefix (search-as-you-type): "quick bro" matches "quick brown" and "quick brother". The prefix expands to the first max\_expansions indexed terms in term order, and the phrase matches with any of them in the last position. One analyzed word matches documents containing any expansion.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.matchphraseprefixquery.field"></a>[`field`](#field-luxir.matchphraseprefixquery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.matchphraseprefixquery.text"></a>[`text`](#field-luxir.matchphraseprefixquery.text) | 2 | `string` | singular | un-analyzed text; its last analyzed word is the prefix |
+| <a id="field-luxir.matchphraseprefixquery.slop"></a>[`slop`](#field-luxir.matchphraseprefixquery.slop) | 3 | `int32` | singular | Same as PhraseQuery.slop. Must be nonnegative. |
+| <a id="field-luxir.matchphraseprefixquery.max_expansions"></a>[`max_expansions`](#field-luxir.matchphraseprefixquery.max_expansions) | 4 | `int32` | singular | Max terms the prefix expands to. Unset/0 = default 50. Negative values are rejected. |
+
 <a id="message-luxir.memorystats"></a>
 
 ### luxir.MemoryStats
@@ -1314,6 +1330,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.match_phrase_prefix"></a>[`match_phrase_prefix`](#field-luxir.query.match_phrase_prefix) | 20 | [`MatchPhrasePrefixQuery`](#message-luxir.matchphraseprefixquery) | oneof [`kind`](#oneof-luxir.query.kind) | phrase whose last word is a prefix |
 
 <a id="message-luxir.querybucket"></a>
 

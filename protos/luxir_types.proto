@@ -287,6 +287,7 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+    MatchPhrasePrefixQuery match_phrase_prefix = 20; // phrase whose last word is a prefix
   }
 }
 
@@ -546,6 +547,23 @@ message PhraseQuery {
   // 2; this is not the number of words between terms. Zero is exact.
   int32 slop = 6;
   repeated int32 positions = 15; // optional positions of the terms
+}
+
+// A phrase whose last analyzed word is a prefix (search-as-you-type):
+// "quick bro" matches "quick brown" and "quick brother". The prefix expands
+// to the first max_expansions indexed terms in term order, and the phrase
+// matches with any of them in the last position. One analyzed word matches
+// documents containing any expansion.
+message MatchPhrasePrefixQuery {
+  string field = 1;
+  string text = 2;  // un-analyzed text; its last analyzed word is the prefix
+
+  // Same as PhraseQuery.slop. Must be nonnegative.
+  int32 slop = 3;
+
+  // Max terms the prefix expands to. Unset/0 = default 50. Negative values
+  // are rejected.
+  int32 max_expansions = 4;
 }
 
 // An expression in the Luxir query language, with strict syntax and precise

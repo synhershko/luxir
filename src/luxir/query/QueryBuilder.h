@@ -21,6 +21,7 @@
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
+#include "luxir/query/PhrasePrefixQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
@@ -1064,6 +1065,61 @@ public:
     return buildPhrase(target,
                        std::span<std::string_view>(terms.data(), terms.size()),
                        std::span<const int64_t>(positions.data(), positions.size()), slop);
+  }
+
+  // match_phrase_prefix: analyze `text` with the field's chain like a phrase
+  // and treat the last token as a prefix. The prefix expands against the
+  // index at weight creation (PhrasePrefixQuery). maxExpansions 0 selects
+  // the default cap.
+  Query* createMatchPhrasePrefixQuery(std::string_view field, std::string_view text,
+                                      int32_t slop = 0, int32_t maxExpansions = 0) {
+    return createMatchPhrasePrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), text,
+                                        slop, maxExpansions);
+  }
+
+  Query* createMatchPhrasePrefixQuery(const ResolvedFieldHandle& target, std::string_view text,
+                                      int32_t slop = 0, int32_t maxExpansions = 0) {
+    if (slop < 0) {
+      throw std::runtime_error("match_phrase_prefix slop must be nonnegative");
+    }
+    if (maxExpansions < 0) {
+      throw std::runtime_error(std::format(
+          "match_phrase_prefix max_expansions must not be negative (got {})", maxExpansions));
+    }
+    if (maxExpansions == 0) maxExpansions = PhrasePrefixQuery::DEFAULT_MAX_EXPANSIONS;
+    positionalTextFieldType(target);
+    auto* chain = fields.chain(target);
+    TokenChain& tc = *chain;
+    Token& tok = tc.head.getToken();
+    TokenStream& tail = *tc.tail;
+
+    std::vector<std::string_view> tokens;
+    std::vector<int64_t> tokenPositions;
+    int64_t pos = -1;  // first token's positionIncrement (>= 1) lands it at >= 0
+    tc.head.setValue(text);
+    tc.reset();
+    while (tail.incrementToken()) {
+      pos += (int64_t) tok.positionIncrement;
+      tokens.push_back(poolCopy(tok.text));
+      tokenPositions.push_back(pos);
+    }
+    if (tokens.empty()) return matchNoDocs();
+
+    auto terms = pool.make_span<std::string_view>(tokens.size() - 1);
+    auto positions = pool.make_span<int32_t>(tokens.size());
+    for (size_t i = 0; i < tokens.size(); i++) {
+      int64_t normalized = tokenPositions[i] - tokenPositions[0];
+      if (normalized > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error(
+            "match_phrase_prefix normalized positions must be in [0, INT_MAX]");
+      }
+      positions[i] = (int32_t) normalized;
+      if (i + 1 < tokens.size()) terms[i] = fitTerm(target, tokens[i]);
+    }
+    // The prefix stays unfitted: a fitted (hashed or truncated) form would
+    // not be a prefix of the terms it should reach.
+    return pool.make<PhrasePrefixQuery>(poolCopy(target.physicalName), terms, positions,
+                                        tokens.back(), slop, maxExpansions);
   }
 
   // Build a phrase query from already-analyzed terms; the terms are used

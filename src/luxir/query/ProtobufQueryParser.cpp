@@ -165,6 +165,14 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
   return builder.matchNoDocs();
 }
 
+luxir::Query* ProtobufQueryParser::parseMatchPhrasePrefix(
+    const luxir::api::MatchPhrasePrefixQuery& query) {
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  return builder.createMatchPhrasePrefixQuery(query.field, query.text, query.slop,
+                                              query.max_expansions);
+}
+
 luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
@@ -505,6 +513,9 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::Match& m) -> luxir::Query* { return parseMatch(m); },
     [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseAnyOf(a); },
     [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parsePhrase(p); },
+    [&](const luxir::api::MatchPhrasePrefixQuery& p) -> luxir::Query* {
+      return parseMatchPhrasePrefix(p);
+    },
     [&](const luxir::api::PrefixQuery& p) -> luxir::Query* { return parsePrefix(p); },
     [&](const luxir::api::WildcardQuery& w) -> luxir::Query* { return parseWildcard(w); },
     [&](const luxir::api::RegexQuery& r) -> luxir::Query* { return parseRegex(r); },

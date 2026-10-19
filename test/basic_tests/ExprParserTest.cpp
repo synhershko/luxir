@@ -565,6 +565,14 @@ TEST_F(ExprParserTest, functionVariety) {
   EXPECT_EQ("dune messiah", p.text);
   EXPECT_EQ(7, asPhrase(*parse("phrase(dune messiah, field=title, slop=7)")).slop);
 
+  const auto* mpp = std::get_if<api::MatchPhrasePrefixQuery>(&parse(
+      "match_phrase_prefix(dune mess, field=title, slop=1, max_expansions=5)")->kind);
+  ASSERT_NE(nullptr, mpp);
+  EXPECT_EQ("dune mess", mpp->text);
+  EXPECT_EQ("title", mpp->field);
+  EXPECT_EQ(1, mpp->slop);
+  EXPECT_EQ(5, mpp->max_expansions);
+
   const auto& f = asFuzzy(*parse("fuzzy(smith, field=status, max_edits=2, prefix_length=0)"));
   EXPECT_EQ("smith", f.term);
   EXPECT_EQ(2, *f.max_edits);

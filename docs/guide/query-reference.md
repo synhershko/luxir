@@ -246,6 +246,36 @@ Slop is not simply the number of intervening words. An adjacent transposition
 costs `2`, and multi-valued text fields have a position gap of `100`. See
 [Query language: terms and phrases](query-language.md#terms-and-phrases).
 
+## Match phrase prefix
+
+A phrase whose last word is a prefix, for search-as-you-type:
+
+```json
+{"match_phrase_prefix":{"field":"title_t","text":"way of ki","slop":0,"max_expansions":50}}
+```
+
+| Field | Meaning |
+|---|---|
+| `field` | Positional TEXT field. Required. |
+| `text` | Unanalyzed text. The field analyzer produces the phrase terms; the last analyzed word is the prefix. |
+| `slop` | Same as `phrase` slop. Default `0`; must be non-negative. |
+| `max_expansions` | Maximum terms the prefix expands to. Unset or `0` uses the default `50`; negative values are rejected. |
+
+The prefix expands to the first `max_expansions` indexed terms that start
+with it, in term (byte) order across all segments, not the most frequent
+ones. A short prefix on a large vocabulary can therefore miss the words a
+user meant; type more of the word or raise the cap. The phrase then matches
+with any expansion in the last position: `"quick bro"` matches
+`quick brown` and `quick brother`. The phrase is matched once over the union
+of the expansions' postings rather than once per expansion, and the last
+position scores as one term whose document frequency is the expansions'
+combined. Phrases with an expanded position do not use block-max pruning.
+
+Text that analyzes to a single word matches documents containing any
+expansion. Text that analyzes to no words, or a prefix with no indexed
+expansion, matches nothing. The expression form is
+`match_phrase_prefix('way of ki', field=title_t, slop=1)`.
+
 ## Prefix
 
 ```json

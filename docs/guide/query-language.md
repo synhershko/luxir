@@ -391,6 +391,7 @@ reference:
 match(dune messiah, field=title_t, operator=AND, min_match=2)
 phrase(dune messiah, field=title_t)
 phrase(dune messiah, field=title_t, slop=2)
+match_phrase_prefix(dune mess, field=title_t)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_t)
 wildcard(du*, field=title_t)

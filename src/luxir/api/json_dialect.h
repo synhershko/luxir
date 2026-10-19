@@ -848,6 +848,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::ExistsQuery>);
           } else if (key == "phrase") {
             arm(std::in_place_type<api::PhraseQuery>);
+          } else if (key == "match_phrase_prefix") {
+            arm(std::in_place_type<api::MatchPhrasePrefixQuery>);
           } else if (key == "knn") {
             arm(std::in_place_type<api::KnnQuery>);
           } else if (key == "constant_score") {
